@@ -18,8 +18,22 @@ const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
 afterEach(cleanup);
 after(() => dom.window.close());
 
-function setup({ workspaces = [], revision = 17, writable = true, status = 'ready', locale = 'en', target = {}, mutate, listDirectory = async path => listing(path ?? 'D:\\home'), namespace = 'local-trusted-paths' } = {}) {
-  const uiWorkspace = { listDirectory: mock.fn(listDirectory) };
+function setup({ workspaces = [], revision = 17, writable = true, status = 'ready', locale = 'en', target = {}, mutate, namespace = 'local-trusted-paths' } = {}) {
+  const pickerProps = [];
+  // This is a contract mock, not a second implementation of the core browser.
+  // Navigation, cross-drive paths and request cancellation belong to core tests.
+  function DirectoryBrowser(props) {
+    pickerProps.push(props);
+    const {open,busy,initialPath,onPicked,onCancel,title,confirmLabel} = props;
+    assert.deepEqual(Object.keys(props).sort(),['open','busy','initialPath','title','confirmLabel','onPicked','onCancel'].sort());
+    assert.equal(typeof open,'boolean');assert.equal(typeof busy,'boolean');
+    assert.equal(typeof onPicked,'function');assert.equal(typeof onCancel,'function');
+    return open ? h('section',{role:'dialog','aria-label':title},
+      h('div',{'data-testid':'picker-initial-path'},initialPath),
+      h('input',{'aria-label':'Mock selected path',defaultValue:'D:\\picked'}),
+      h('button',{disabled:busy,onClick:()=>onPicked(screen.getByRole('textbox',{name:'Mock selected path'}).value)},confirmLabel),
+      h('button',{onClick:onCancel},localeSnapshot.active.startsWith('zh')?'取消':'Cancel')) : null;
+  }
   let snapshot = { status, writable, revision, value: { workspaces } };
   const subscribers = new Set();
   const form = {
@@ -35,29 +49,25 @@ function setup({ workspaces = [], revision = 17, writable = true, status = 'read
   const registerLocale = mock.fn((namespace, language, dictionary) => { dictionaries.set(`${namespace}:${language}`, dictionary); return () => {}; });
   const mirrorSnapshot = {view:{namespaces:[{ns:namespace}]}};
   const getForm = mock.fn(ns => {assert.equal(ns,namespace);return form;});
-  const primitives = {
-    MenuItemButton: ({ onSelect, children }) => h('button', { role: 'menuitem', onClick: onSelect }, children),
-    Button: ({ variant, ...props }) => h('button', props),
-    Modal: ({ open, title, children, footer, onClose, closeLabel }) => open ? h('section', { role: 'dialog', 'aria-label': title },
-      h('button', { 'aria-label': closeLabel, onClick: onClose }, '×'), children, footer) : null,
-  };
   window.__ModuleLoader__ = {
     load({ id, factory }) {
       assert.equal(id, 'dsh-plugin-trusted-paths');
       const plugin = factory(name => {
         if (name === 'react') return React;
-        if (name === '@deepseek-ai/dsh-client-ui-primitives') return primitives;
         throw new Error(`Unexpected loader dependency: ${name}`);
       });
-      assert.ok(plugin.inject.includes('uiWorkspace'));
+      assert.ok(plugin.inject.includes('directoryBrowser'));
       plugin.apply({
-        uiWorkspace,
+        directoryBrowser: {render: props => h(DirectoryBrowser,props)},
         effect: fn => fn(),
         locale: {
           register: registerLocale,
           getSnapshot: () => localeSnapshot,
           subscribe: fn => { localeSubscribers.add(fn); return () => localeSubscribers.delete(fn); },
-          bind: namespace => key => dictionaries.get(`${namespace}:${localeSnapshot.active.startsWith('zh') ? 'zh' : 'en'}`)?.[key] ?? key,
+          bind: namespace => key => {
+            const zh = localeSnapshot.active.startsWith('zh');
+            return dictionaries.get(`${namespace}:${zh?'zh':'en'}`)?.[key] ?? key;
+          },
         },
         configForms: { get: getForm, describe: () => ({getSnapshot: () => mirrorSnapshot, subscribe: () => () => {}}) },
         slots: {
@@ -98,180 +108,170 @@ function setup({ workspaces = [], revision = 17, writable = true, status = 'read
   function setLocale(active) {
     act(() => { localeSnapshot = { active, revision: localeSnapshot.revision + 1 }; for (const listener of localeSubscribers) listener(); });
   }
-  return { form, open, updateState, setMenuOpen, setLocale, uiWorkspace };
+  return { form, open, updateState, setMenuOpen, setLocale, pickerProps };
 }
-const primary = () => screen.getByRole('textbox', { name: /Primary folder/ });
-const save = () => screen.getByRole('button', { name: 'Save and authorize' });
+const root = 'D:\\projects\\alpha';
+const save = () => screen.getByRole('button', { name: 'Save and authorize', exact:true });
 const click = name => fireEvent.click(screen.getByRole('button', { name, exact: true }));
-function listing(path, children = []) {
-  const pieces = path.split('\\').filter(Boolean);
-  const crumbs = pieces.map((name, index) => ({ name, path: pieces.slice(0,index+1).join('\\') + (index===0?'\\':''), hidden:false }));
-  return { path, home:'C:\\Users\\test', crumbs, entries:children.map(([name,path])=>({name,path,hidden:false})), truncated:false };
+const radios = () => screen.getAllByRole('radio');
+const primary = () => radios().find(r=>r.checked);
+const choosePrimary = path => fireEvent.click(screen.getByRole('radio',{name:'Primary folder '+path,exact:true}));
+async function browse() { await act(async()=>click('Add folder')); }
+async function select(path) {
+  await browse();
+  fireEvent.change(screen.getByRole('textbox',{name:'Mock selected path'}),{target:{value:path}});
+  click('Add folder');
 }
-async function browse(kind = 'primary') {
-  await act(async()=>click(kind==='primary'?'Choose folder':'Add reference folder'));
-}
-async function select(path, kind = 'primary') {
-  await browse(kind);
-  // The mock backend returns the selected absolute path, as the real service does.
-  assert.equal(screen.getByRole('textbox',{name:'Current path'}).value,path);
-  click('Select current folder');
-}
+function entry(primaryFolder=root,references=[]) { return {workspaceId:'workspace-a',primaryFolder,references}; }
 
-test('menu opens readonly path and reference list without mutating', () => {
+test('one unified list, unique primary badge and nonempty default; draft does not authorize',()=>{
   const app=setup();app.open();
-  assert.equal(primary().value,'D:\\projects\\alpha');
-  assert.equal(primary().readOnly,true);
-  assert.equal(screen.queryByRole('textbox',{name:/References/}),null);
-  assert.ok(screen.getByText('No reference folders'));
-  assert.equal(save().disabled,false);
+  assert.equal(screen.getAllByRole('list').length,1);
+  assert.equal(radios().length,1);assert.equal(primary().getAttribute('aria-label'),'Primary folder '+root);
+  assert.ok(screen.getByText('Primary folder',{exact:true}));
+  const remove=screen.getByRole('button',{name:'Remove '+root,exact:true});
+  assert.equal(remove.disabled,true);
+  assert.match(screen.getByText(/To remove the primary/).textContent,/At least one folder/);
+  fireEvent.click(remove);assert.equal(radios().length,1);
+  assert.equal(save().disabled,false);assert.equal(app.form.mutate.mock.callCount(),0);
+});
+
+test('setting any folder primary preserves every other directory and disables only primary removal',async()=>{
+  const app=setup({workspaces:[entry('D:\\main',['D:\\one','D:\\two'])]});app.open();
+  choosePrimary('D:\\two');
+  assert.equal(radios().filter(r=>r.checked).length,1);
+  assert.equal(primary().getAttribute('aria-label'),'Primary folder D:\\two');
+  for(const path of ['D:\\main','D:\\one','D:\\two'])assert.ok(screen.getByText(path,{exact:true}));
+  assert.equal(screen.getByRole('button',{name:'Remove D:\\two',exact:true}).disabled,true);
+  assert.equal(screen.getByRole('button',{name:'Remove D:\\main',exact:true}).disabled,false);
   assert.equal(app.form.mutate.mock.callCount(),0);
+  await act(async()=>click('Save and authorize'));
+  assert.deepEqual(app.form.mutate.mock.calls[0].arguments[0][0].value,[entry('D:\\two',['D:\\main','D:\\one'])]);
 });
 
-test('workspaceId takes priority; legacy defaults match case insensitively', () => {
-  setup({workspaces:[{primaryFolder:'D:\\projects\\alpha',references:['D:\\legacy']},{workspaceId:'workspace-a',primaryFolder:'D:\\moved',references:['D:\\one','D:\\two']}]}).open();
-  assert.equal(primary().value,'D:\\moved');assert.ok(screen.getByText('D:\\one'));assert.ok(screen.getByText('D:\\two'));
-  cleanup();
-  setup({workspaces:[{primaryFolder:'d:\\PROJECTS\\ALPHA',references:['D:\\legacy']}]}).open();
-  assert.equal(primary().value,'d:\\PROJECTS\\ALPHA');assert.ok(screen.getByText('D:\\legacy'));
+test('nonprimary removal stays draft; removing old primary after promotion is allowed',async()=>{
+  const app=setup({workspaces:[entry('D:\\main',['D:\\one','D:\\two'])]});app.open();
+  click('Remove D:\\one');choosePrimary('D:\\two');click('Remove D:\\main');
+  assert.equal(radios().length,1);assert.equal(app.form.mutate.mock.callCount(),0);
+  assert.equal(screen.getByRole('button',{name:'Remove D:\\two',exact:true}).disabled,true);
+  await act(async()=>click('Save and authorize'));
+  assert.deepEqual(app.form.mutate.mock.calls[0].arguments[0][0].value,[entry('D:\\two',[])]);
 });
 
-test('browse navigates child, parent and home using exact host paths in one Modal', async()=>{
-  const root='D:\\projects\\alpha', child=root+'\\child';
-  const app=setup({listDirectory:async path=>listing(path, path===root?[['child',child]]:[])});app.open();
+test('shared browser contract replaces main Modal without losing draft, cancel discards only picker',async()=>{
+  const app=setup({workspaces:[entry(root,['D:\\existing'])]});app.open();choosePrimary('D:\\existing');
   await browse();assert.equal(screen.getAllByRole('dialog').length,1);
   assert.equal(screen.queryByRole('button',{name:'Save and authorize'}),null);
-  await act(async()=>click('child'));
-  assert.equal(screen.getByRole('textbox',{name:'Current path'}).value,child);
-  await act(async()=>click('Parent folder'));
-  assert.equal(screen.getByRole('textbox',{name:'Current path'}).value,root);
-  await act(async()=>click('Home folder'));
-  assert.equal(screen.getByRole('textbox',{name:'Current path'}).value,'C:\\Users\\test');
-  click('Select current folder');assert.equal(primary().value,'C:\\Users\\test');
+  assert.equal(screen.getByTestId('picker-initial-path').textContent,'D:\\existing');
+  assert.equal(screen.getByRole('dialog').getAttribute('aria-label'),'Choose directory');
+  click('Cancel');assert.equal(primary().getAttribute('aria-label'),'Primary folder D:\\existing');
+  await select('E:\\new');assert.ok(screen.getByText('E:\\new'));
+  assert.equal(primary().getAttribute('aria-label'),'Primary folder D:\\existing');
   assert.equal(app.form.mutate.mock.callCount(),0);
-  assert.ok(app.uiWorkspace.listDirectory.mock.calls.every(call=>call.arguments[1] instanceof AbortSignal));
+  click('Cancel');assert.equal(screen.queryByRole('dialog'),null);
+  click('Open workspace menu');app.open();assert.equal(primary().getAttribute('aria-label'),'Primary folder '+root);
+  assert.equal(screen.queryByText('E:\\new'),null);
 });
 
-test('save retains Host payload, opening revision, other rows and dynamic mirror namespace', async()=>{
-  const other={workspaceId:'workspace-b',primaryFolder:'D:\\beta',references:['D:\\shared'],extra:{keep:true}};
-  let chosen='D:\\new-primary';
-  const app=setup({namespace:'include:local-trusted-paths',revision:'revision-42',workspaces:[{workspaceId:'workspace-a',primaryFolder:'D:\\old',references:[]},other],listDirectory:async()=>listing(chosen)});
-  app.open();await select(chosen);chosen='D:\\new-ref';await select(chosen,'reference');
+test('duplicate normalized paths return to management with friendly message and no mutation',async()=>{
+  const app=setup({workspaces:[entry('D:\\main',['D:\\ref','d:/REF/','D:\\main'])]});app.open();
+  assert.equal(radios().length,2);
+  await select('d:/MAIN/');assert.match(screen.getByRole('status').textContent,/already in the list/);
+  assert.equal(radios().length,2);assert.equal(screen.getAllByRole('dialog').length,1);
+  await select('d:/REF/');assert.equal(radios().length,2);
+  await select('D:\\new');await select('d:/NEW/');assert.equal(radios().length,3);
   assert.equal(app.form.mutate.mock.callCount(),0);
-  app.updateState({revision:'revision-43'});
+});
+
+test('save preserves revision fence, dynamic mirror namespace and untouched workspace rows',async()=>{
+  const other={workspaceId:'workspace-b',primaryFolder:'D:\\beta',references:['D:\\shared'],extra:{keep:true}};
+  const app=setup({namespace:'include:local-trusted-paths',revision:'revision-42',workspaces:[entry('D:\\old'),other]});
+  app.open();await select('D:\\new');choosePrimary('D:\\new');
+  app.updateState({revision:'revision-43',value:{workspaces:[]}});
   await act(async()=>click('Save and authorize'));
   assert.equal(screen.queryByRole('dialog'),null);
-  assert.deepEqual(app.form.mutate.mock.calls[0].arguments,[[{op:'set',path:['workspaces'],value:[other,{workspaceId:'workspace-a',primaryFolder:'D:\\new-primary',references:['D:\\new-ref']}]}],'revision-42']);
+  assert.deepEqual(app.form.mutate.mock.calls[0].arguments,[[{op:'set',path:['workspaces'],value:[other,entry('D:\\new',['D:\\old'])]}],'revision-42']);
   assert.equal(app.form.mutate.mock.calls[0].arguments[0][0].value[0],other);
 });
 
-test('reference remove stays draft and legacy save migrates without duplicate',async()=>{
+test('workspaceId takes precedence and legacy case-insensitive row migrates without duplicate',async()=>{
+  setup({workspaces:[{primaryFolder:root,references:['D:\\legacy']},entry('D:\\moved',['D:\\one'])]}).open();
+  assert.equal(primary().getAttribute('aria-label'),'Primary folder D:\\moved');cleanup();
   const app=setup({workspaces:[{primaryFolder:'d:\\PROJECTS\\ALPHA',references:['D:\\legacy']}]});app.open();
-  click('Remove D:\\legacy');assert.equal(app.form.mutate.mock.callCount(),0);
+  assert.equal(primary().getAttribute('aria-label'),'Primary folder d:\\PROJECTS\\ALPHA');click('Remove D:\\legacy');
   await act(async()=>click('Save and authorize'));
-  assert.deepEqual(app.form.mutate.mock.calls[0].arguments[0][0].value,[{workspaceId:'workspace-a',primaryFolder:'d:\\PROJECTS\\ALPHA',references:[]}]);
+  assert.deepEqual(app.form.mutate.mock.calls[0].arguments[0][0].value,[entry('d:\\PROJECTS\\ALPHA')]);
 });
 
-test('browser cancellation and close do not change draft; main Cancel discards draft',async()=>{
-  const app=setup({listDirectory:async()=>listing('D:\\discard')});app.open();
-  await browse();click('Cancel');assert.equal(primary().value,'D:\\projects\\alpha');
-  await browse('reference');click('Close');assert.ok(screen.getByText('No reference folders'));
-  await select('D:\\discard');click('Cancel');
-  assert.equal(screen.queryByRole('dialog'),null);assert.equal(app.form.mutate.mock.callCount(),0);
-  click('Open workspace menu');app.open();assert.equal(primary().value,'D:\\projects\\alpha');
+test('readonly disables add, primary change, remove and save',()=>{
+  const app=setup({writable:false,workspaces:[entry(root,['D:\\ref'])]});app.open();
+  for(const radio of radios())assert.equal(radio.disabled,true);
+  for(const name of ['Add folder','Remove '+root,'Remove D:\\ref','Save and authorize'])assert.equal(screen.getByRole('button',{name,exact:true}).disabled,true);
+  choosePrimary('D:\\ref');click('Add folder');click('Remove D:\\ref');click('Save and authorize');
+  assert.equal(app.pickerProps.length,0);assert.equal(app.form.mutate.mock.callCount(),0);
 });
 
-test('main modal close dismisses without saving',()=>{
-  const app=setup();app.open();click('Close');assert.equal(screen.queryByRole('dialog'),null);assert.equal(app.form.mutate.mock.callCount(),0);
+test('readonly transition while picker open blocks accepting selection but permits cancel',async()=>{
+  const app=setup();app.open();await browse();app.updateState({writable:false});
+  assert.equal(screen.getByRole('button',{name:'Add folder'}).disabled,true);
+  click('Add folder');click('Cancel');assert.equal(radios().length,1);assert.equal(app.form.mutate.mock.callCount(),0);
 });
 
-test('blank primary, readonly and loading config cannot save or pick',()=>{
+test('loading/unavailable config cannot save; ready initializes default; blank primary cannot save',()=>{
   const app=setup({status:'loading'});app.open();assert.ok(screen.getByText('Loading…'));assert.equal(save().disabled,true);
-  app.updateState({status:'ready',writable:false,value:{workspaces:[{workspaceId:'workspace-a',primaryFolder:'',references:[]}]}});
-  assert.equal(save().disabled,true);assert.equal(screen.getByRole('button',{name:'Choose folder'}).disabled,true);
-  assert.equal(screen.getByRole('button',{name:'Add reference folder'}).disabled,true);
-  click('Choose folder');click('Save and authorize');assert.equal(app.uiWorkspace.listDirectory.mock.callCount(),0);assert.equal(app.form.mutate.mock.callCount(),0);
+  app.updateState({status:'unavailable'});assert.ok(screen.getByText(/Configuration is unavailable/));
+  app.updateState({status:'ready',value:{workspaces:[entry('D:\\ready')]}});
+  assert.equal(primary().getAttribute('aria-label'),'Primary folder D:\\ready');assert.equal(save().disabled,false);
+  cleanup();setup({workspaces:[entry('')]}).open();assert.equal(save().disabled,true);
 });
 
-test('loading config initializes when ready',()=>{
-  const app=setup({status:'loading'});app.open();
-  app.updateState({status:'ready',value:{workspaces:[{workspaceId:'workspace-a',primaryFolder:'D:\\ready',references:[]}]}});
-  assert.equal(primary().value,'D:\\ready');assert.equal(save().disabled,false);
-});
-
-test('pending save disables picking, removal, repeat save and cancellation',async()=>{
+test('pending save disables edits, repeat save and dismissal',async()=>{
   let resolveSave;
-  const app=setup({workspaces:[{workspaceId:'workspace-a',primaryFolder:'D:\\main',references:['D:\\ref']}],mutate:()=>new Promise(resolve=>{resolveSave=resolve;})});app.open();click('Save and authorize');
-  for(const name of ['Choose folder','Add reference folder','Remove D:\\ref','Saving…','Cancel'])assert.equal(screen.getByRole('button',{name}).disabled,true);
+  const app=setup({workspaces:[entry(root,['D:\\ref'])],mutate:()=>new Promise(resolve=>{resolveSave=resolve;})});app.open();click('Save and authorize');
+  for(const name of ['Add folder','Remove D:\\ref','Saving…','Cancel'])assert.equal(screen.getByRole('button',{name,exact:true}).disabled,true);
+  for(const radio of radios())assert.equal(radio.disabled,true);
   click('Close');assert.ok(screen.getByRole('dialog'));assert.equal(app.form.mutate.mock.callCount(),1);
   await act(async()=>resolveSave(true));assert.equal(screen.queryByRole('dialog'),null);
 });
 
-test('refused mutation keeps selected reference draft',async()=>{
-  const app=setup({mutate:async()=>false,listDirectory:async()=>listing('D:\\draft')});app.open();await select('D:\\draft','reference');
+test('refused save retains draft and allows retry',async()=>{
+  const app=setup({mutate:async()=>false});app.open();await select('D:\\draft');choosePrimary('D:\\draft');
   await act(async()=>click('Save and authorize'));
-  assert.match(screen.getByRole('status').textContent,/Configuration refused/);assert.ok(screen.getByText('D:\\draft'));assert.equal(save().disabled,false);
+  assert.match(screen.getByRole('status').textContent,/Configuration refused/);
+  assert.equal(primary().getAttribute('aria-label'),'Primary folder D:\\draft');assert.equal(save().disabled,false);
 });
 
-test('directory list failure offers retry without changing draft or saving',async()=>{
-  let fail=true;
-  const app=setup({listDirectory:async()=>{if(fail)throw new Error('Permission denied');return listing('D:\\retry');}});app.open();await browse();
-  assert.match(screen.getByRole('alert').textContent,/Permission denied/);assert.equal(screen.getByRole('button',{name:'Select current folder'}).disabled,true);
-  fail=false;await act(async()=>click('Retry'));click('Select current folder');assert.equal(primary().value,'D:\\retry');assert.equal(app.form.mutate.mock.callCount(),0);
+test('live locale changes manager and shared picker text without losing draft',async()=>{
+  const app=setup();app.open();await select('D:\\draft');app.setLocale('zh-CN');
+  assert.equal(screen.getByRole('dialog').getAttribute('aria-label'),'目录设置 · Alpha');assert.ok(screen.getByText('D:\\draft'));
+  click('添加目录');assert.equal(screen.getByRole('dialog').getAttribute('aria-label'),'选择目录');
+  assert.ok(screen.getByRole('button',{name:'添加目录'}));assert.ok(screen.getByRole('button',{name:'取消'}));
+  app.setLocale('en');assert.equal(screen.getByRole('dialog').getAttribute('aria-label'),'Choose directory');
+  click('Cancel');assert.ok(screen.getByText('D:\\draft'));assert.equal(app.form.mutate.mock.callCount(),0);
 });
 
-test('scan busy blocks selection/save; cancellation aborts and ignores stale completion',async()=>{
+test('Chinese primary constraint visible; main close does not save',()=>{
+  const app=setup({locale:'zh-CN'});app.open();assert.ok(screen.getByText(/主目录不可移除/));
+  assert.equal(screen.getByRole('button',{name:'移除 '+root}).disabled,true);
+  click('关闭');assert.equal(screen.queryByRole('dialog'),null);assert.equal(app.form.mutate.mock.callCount(),0);
+});
+
+test('local modal autofocus, Tab containment, Escape and focus restoration use real implementation',()=>{
+  const app=setup();const trigger=screen.getByRole('button',{name:'Open workspace menu'});trigger.focus();app.open();
+  const closeButton=screen.getByRole('button',{name:'Close',exact:true});
+  assert.ok(document.activeElement===closeButton);
+  fireEvent.keyDown(closeButton,{key:'Tab',shiftKey:true});assert.ok(document.activeElement===save(),document.activeElement.outerHTML);
+  fireEvent.keyDown(save(),{key:'Tab'});assert.ok(document.activeElement===closeButton);
+  fireEvent.keyDown(document,{key:'Escape',isComposing:true});assert.ok(screen.getByRole('dialog'));
+  fireEvent.keyDown(document,{key:'Escape'});assert.equal(screen.queryByRole('dialog'),null);
+  assert.ok(document.activeElement===trigger);assert.equal(app.form.mutate.mock.callCount(),0);
+});
+
+test('Escape cannot dismiss while saving; backdrop dismisses only when idle',async()=>{
   let finish;
-  const app=setup({listDirectory:()=>new Promise(resolve=>{finish=resolve;})});app.open();await browse();
-  const signal=app.uiWorkspace.listDirectory.mock.calls[0].arguments[1];
-  assert.equal(screen.getByRole('button',{name:'Select current folder'}).disabled,true);assert.equal(screen.queryByRole('button',{name:'Save and authorize'}),null);
-  click('Cancel');assert.equal(signal.aborted,true);
-  await act(async()=>finish(listing('D:\\stale')));
-  assert.equal(primary().value,'D:\\projects\\alpha');assert.equal(app.form.mutate.mock.callCount(),0);
-});
-
-test('failed starting path can recover by browsing Host home without input',async()=>{
-  const app=setup({listDirectory:async path=>{if(path)throw new Error('Missing folder');return listing('C:\\Users\\test');}});app.open();await browse();
-  assert.ok(screen.getByRole('alert'));await act(async()=>click('Home folder'));
-  assert.equal(app.uiWorkspace.listDirectory.mock.calls.at(-1).arguments[0],undefined);
-  click('Select current folder');assert.equal(primary().value,'C:\\Users\\test');
-});
-
-test('a cancelled scan cannot overwrite a newer browser result',async()=>{
-  let finishOld, calls=0;
-  const app=setup({listDirectory:()=>++calls===1?new Promise(resolve=>{finishOld=resolve;}):Promise.resolve(listing('D:\\fresh'))});app.open();await browse();
-  const oldSignal=app.uiWorkspace.listDirectory.mock.calls[0].arguments[1];click('Cancel');await browse('reference');
-  assert.equal(oldSignal.aborted,true);await act(async()=>finishOld(listing('D:\\stale')));
-  assert.equal(screen.getByRole('textbox',{name:'Current path'}).value,'D:\\fresh');click('Select current folder');assert.ok(screen.getByText('D:\\fresh'));assert.equal(app.form.mutate.mock.callCount(),0);
-});
-
-test('unmount aborts a pending scan',async()=>{
-  const app=setup({listDirectory:()=>new Promise(()=>{})});app.open();await browse();
-  const signal=app.uiWorkspace.listDirectory.mock.calls[0].arguments[1];cleanup();assert.equal(signal.aborted,true);
-});
-
-test('case and slash-equivalent primary/ref duplicates are rejected and initial refs deduped',async()=>{
-  let chosen='d:/REF/';
-  const app=setup({workspaces:[{workspaceId:'workspace-a',primaryFolder:'D:\\main',references:['D:\\ref','d:/REF/','D:\\main']}],listDirectory:async()=>listing(chosen)});app.open();
-  assert.equal(screen.getAllByRole('button',{name:/^Remove /}).length,1);
-  await browse();click('Select current folder');assert.match(screen.getByRole('status').textContent,/already the primary or a reference/);click('Cancel');assert.equal(primary().value,'D:\\main');
-  chosen='d:/MAIN/';await browse('reference');click('Select current folder');assert.match(screen.getByRole('status').textContent,/already the primary or a reference/);click('Cancel');
-  chosen='D:\\new';await select(chosen,'reference');await browse('reference');click('Select current folder');assert.match(screen.getByRole('status').textContent,/already the primary or a reference/);
-  assert.equal(app.form.mutate.mock.callCount(),0);
-});
-
-test('readonly transition while browser open prevents accepting selection',async()=>{
-  const app=setup({listDirectory:async()=>listing('D:\\picked')});app.open();await browse();app.updateState({writable:false});
-  assert.equal(screen.getByRole('button',{name:'Select current folder'}).disabled,true);click('Select current folder');click('Cancel');assert.equal(primary().value,'D:\\projects\\alpha');
-});
-
-test('live locale switches main and browser labels without losing draft',async()=>{
-  const app=setup({listDirectory:async()=>listing('D:\\draft')});app.open();await select('D:\\draft','reference');app.setLocale('zh-CN');
-  assert.equal(screen.getByRole('dialog').getAttribute('aria-label'),'目录设置 · Alpha');assert.ok(screen.getByText('D:\\draft'));assert.ok(screen.getByRole('button',{name:'保存并授权'}));
-  await act(async()=>click('选择文件夹'));assert.equal(screen.getByRole('dialog').getAttribute('aria-label'),'选择目录 · Alpha');
-  assert.ok(screen.getByRole('button',{name:'选择当前目录'}));click('取消');assert.ok(screen.getByText('D:\\draft'));
-});
-
-test('Chinese menu, readonly label and cancellation are localized',()=>{
-  const app=setup({locale:'zh-CN'});app.open();assert.equal(screen.getByRole('textbox',{name:'主目录'}).readOnly,true);click('取消');assert.equal(app.form.mutate.mock.callCount(),0);assert.equal(screen.queryByRole('dialog'),null);
+  const app=setup({mutate:()=>new Promise(resolve=>{finish=resolve;})});app.open();click('Save and authorize');
+  fireEvent.keyDown(document,{key:'Escape'});assert.ok(screen.getByRole('dialog'));
+  fireEvent.click(document.querySelector('.trusted-paths-mask'));assert.ok(screen.getByRole('dialog'));
+  await act(async()=>finish(false));
+  fireEvent.click(document.querySelector('.trusted-paths-mask'));assert.equal(screen.queryByRole('dialog'),null);
 });

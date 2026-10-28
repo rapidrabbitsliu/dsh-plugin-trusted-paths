@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-trusted-paths",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "description": "Workspace-scoped trusted folder references and directory picker for a compatible DeepSeek Harness",
   "license": "MIT",
@@ -15,5 +15,5 @@
   "dependencies":{"@deepseek-ai/schemastery":"3.18.5"},
   "devDependencies":{"react":"18.3.1","react-dom":"18.3.1","@testing-library/react":"16.3.3","jsdom":"29.1.1"},
   "publishConfig":{"access":"public","registry":"https://registry.npmjs.org"},
-  "dsh":{"bundle":{"patch":"./cordis.patch.yml"},"client":{"platform":"web","immediately":true,"inject":["@deepseek-ai/dsh-client-ui-workspace","@deepseek-ai/dsh-client-ui-settings"],"external":["@deepseek-ai/dsh-client-ui-primitives"]}}
+  "dsh":{"bundle":{"patch":"./cordis.patch.yml"},"client":{"platform":"web","immediately":true,"inject":["@deepseek-ai/dsh-client-ui-workspace","@deepseek-ai/dsh-client-ui-settings","@deepseek-ai/dsh-client-ui-directory-picker-browse"]}}
 }

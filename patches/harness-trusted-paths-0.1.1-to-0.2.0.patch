@@ -1,0 +1,426 @@
+diff --git a/packages/client/ui-directory-picker-browse/README.md b/packages/client/ui-directory-picker-browse/README.md
+index ff4e9cc8e3e46c94dac7c844b91dc253834051ce..620eda5a2eb9826a9a67e603a7cc02d7c85990f2 100644
+--- a/packages/client/ui-directory-picker-browse/README.md
++++ b/packages/client/ui-directory-picker-browse/README.md
+@@ -27,6 +27,18 @@ This package provides the in-app directory-browsing surface for the Web GUI: a S
+ 
+ Mount this plugin alongside `ui-workspace` and the host backend [`dsh-host-directory-picker-browse`](../../host/directory-picker-browse/README.md); one cordis.yml row then composes the whole browse picking interaction. When a workspace flow opens a directory request, the user sees the in-app dialog: a header with the path breadcrumb and an editable path zone, then a single full-width level until a row is selected, after which the row splits into level and children columns.
+ 
++### Sharing the browser
++
++Other Client plugins inject `directoryBrowser` and render
++`ctx.directoryBrowser.render({ open, busy, initialPath, title, confirmLabel, onPicked, onCancel })`.
++Only `open`, `busy`, `onPicked(path)` and `onCancel()` are required. The service
++owns Host listing/creation calls and locale binding; the caller owns confirmation
++and cancellation. Declare this package in `dsh.client.inject` for activation
++ordering, not as a plain-JavaScript `require()` dependency. Typed consumers can
++also import `DirectoryBrowser` and `DirectoryBrowserProps` from the `/client`
++type surface. The browser's location selector lists Home plus the optional
++Host-provided roots; it never guesses Windows drive letters.
++
+ ### Navigating and creating
+ 
+ Step through folders, edit the path directly, or filter the last pane by prefix; a Host-flagged hidden entry stays hidden until the footer toggle reveals it. **New folder** opens a nested create dialog targeting the selected folder and selects what it creates; **Open** adopts the selected folder, falling back to the listed level. Confirming a directory is the picked path; dismissing the dialog is the cancellation.
+diff --git a/packages/client/ui-directory-picker-browse/README.zh.md b/packages/client/ui-directory-picker-browse/README.zh.md
+index 4b7ef6241d50a9586240f78270525c6628e6e578..c2bc118abc1ffc0deb3327c5b59e3f535e7a0084 100644
+--- a/packages/client/ui-directory-picker-browse/README.zh.md
++++ b/packages/client/ui-directory-picker-browse/README.zh.md
+@@ -27,6 +27,16 @@ kind: "package-reference"
+ 
+ 与 `ui-workspace` 及宿主后端 [`dsh-host-directory-picker-browse`](../../host/directory-picker-browse/README.zh.md) 一起挂载本插件；一行 cordis.yml 随即组合出完整的浏览拾取交互。当工作区流程发起目录请求时，用户看到应用内对话框：头部承载路径面包屑与可编辑路径区，未选中行时是一整栏层级，选中后该行分为层级与子项两栏。
+ 
++### 共用目录浏览器
++
++其他 Client 插件注入 `directoryBrowser`，渲染
++`ctx.directoryBrowser.render({ open, busy, initialPath, title, confirmLabel, onPicked, onCancel })`。
++只有 `open`、`busy`、`onPicked(path)` 和 `onCancel()` 必填；Service 负责宿主的
++列目录、创建目录调用与 locale 绑定，调用方负责确认与取消。将本包放入
++`dsh.client.inject` 声明激活顺序，不要作为普通 JavaScript `require()` 依赖。
++有类型的调用方也可从 `/client` 类型入口导入 `DirectoryBrowser` 与
++`DirectoryBrowserProps`。位置选择器列出主目录及可选的宿主 `roots`，不会猜测 Windows 盘符。
++
+ ### 导航与创建
+ 
+ 逐级进入文件夹、直接编辑路径，或用前缀过滤最后一栏；宿主标记的隐藏条目默认不显示，直到页脚开关揭开。**新建文件夹**打开一个嵌套创建对话框，目标为选中的文件夹，并选中它创建出来的那个；**打开**采纳选中的文件夹，没有选中时回落到当前层级。确认一个目录即为选中的路径；关闭对话框即为取消。
+diff --git a/packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.module.css b/packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.module.css
+index 7155a83ff8fa42ae6034e71fffbf45bd8bd7d58e..972d10a4a1d71bfdb328548b97117bb896f46dd6 100644
+--- a/packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.module.css
++++ b/packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.module.css
+@@ -32,6 +32,22 @@
+   border-bottom: 0.5px solid var(--dsw-alias-border-l3);
+ }
+ 
++.locationSelect {
++  align-self: flex-start;
++  max-width: 100%;
++  border: 1px solid var(--dsw-alias-border-l2);
++  border-radius: var(--dsw-radius-sm);
++  padding: 3px 8px;
++  font: inherit;
++  font-size: 13px;
++  color: var(--dsw-alias-label-primary);
++  background: var(--dsw-alias-bg-layer-2);
++}
++
++.locationSelect:focus-visible {
++  outline: var(--dsw-focus-ring-width) solid var(--dsw-alias-state-business-primary);
++}
++
+ .title {
+   display: flex;
+   align-items: flex-end;
+diff --git a/packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.tsx b/packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.tsx
+index 5ad53b31268010d5a973324a87c4a1af641b08ff..a977d711644c6fdcc56266649c9ca8bc44ee7695 100644
+--- a/packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.tsx
++++ b/packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.tsx
+@@ -67,6 +67,12 @@ export interface DirectoryBrowserProps {
+   onClose: () => void
+   /** The owner's confirm is in flight: Open disables, the view freezes. */
+   busy: boolean
++  /** Absolute Host path to list on open; omitted starts at the Host home. */
++  initialPath?: string
++  /** Owner-localized dialog title; omitted keeps the workspace flow's copy. */
++  title?: string
++  /** Owner-localized confirmation label; omitted keeps "Open". */
++  confirmLabel?: string
+   /** Localized copy. */
+   t: Translate
+ }
+@@ -270,7 +276,9 @@ function LevelColumn({ entries, selectedPath, busy, onPick, showHidden, filterPr
+  * @param props - owner-controlled browser props.
+  * @returns the dialog element (null while closed, via Modal).
+  */
+-export function DirectoryBrowser({ open, listDirectory, createDirectory, onOpen, onClose, busy, t }: DirectoryBrowserProps) {
++export function DirectoryBrowser({
++  open, listDirectory, createDirectory, onOpen, onClose, busy, t, initialPath, title, confirmLabel,
++}: DirectoryBrowserProps) {
+   // Miller state: the listed level, the selected row in it, and the selected
+   // folder's own listing (the right column; null while nothing is selected).
+   const [parent, setParent] = useState<DirectoryListing | null>(null)
+@@ -580,7 +588,7 @@ export function DirectoryBrowser({ open, listDirectory, createDirectory, onOpen,
+       setChild(null)
+       setCreatingFolder(false)
+       setShowHidden(false)
+-      navigate()
++      navigate(initialPath)
+       return
+     }
+     supersede()
+@@ -597,7 +605,7 @@ export function DirectoryBrowser({ open, listDirectory, createDirectory, onOpen,
+     // flags armed; retire them so a later render cannot consume them.
+     refocusPick.current = false
+     refocusEditZone.current = false
+-  }, [open, navigate, supersede])
++  }, [open, navigate, supersede, initialPath])
+ 
+   /** The folder a create or Open acts on: the selection, else the listed level. */
+   const targetPath = selected?.path ?? parent?.path ?? null
+@@ -768,7 +776,7 @@ export function DirectoryBrowser({ open, listDirectory, createDirectory, onOpen,
+       // adoption pins the flow — dismissing it would leave the owner's
+       // createWorkspace to land after an apparent cancel.
+       onClose={() => { if (folderDraft === null && !busy) onClose() }}
+-      title={t('browser.title')}
++      title={title ?? t('browser.title')}
+       className={clsx(css.dialog)}
+       headless
+     >
+@@ -816,7 +824,22 @@ export function DirectoryBrowser({ open, listDirectory, createDirectory, onOpen,
+         }}
+       >
+         <div className={css.header}>
+-          <h2 className={css.title}>{t('browser.title')}</h2>
++          <h2 className={css.title}>{title ?? t('browser.title')}</h2>
++          {crumbSource !== null && (
++            <select
++              className={css.locationSelect}
++              aria-label={t('browser.location')}
++              value=""
++              disabled={parentInert}
++              onChange={(event) => { if (event.target.value !== '') navigate(event.target.value) }}
++            >
++              <option value="" disabled>{t('browser.location')}</option>
++              <option value={crumbSource.home}>{t('browser.home')}</option>
++              {(crumbSource.roots ?? parent?.roots ?? []).map(root => (
++                <option key={root.path} value={root.path}>{root.name}</option>
++              ))}
++            </select>
++          )}
+           <div className={css.crumbBar}>
+             {pathDraft === null
+               ? (
+@@ -999,7 +1022,7 @@ export function DirectoryBrowser({ open, listDirectory, createDirectory, onOpen,
+             /* v8 ignore next -- narrowing guard: Open disables while no target exists. */
+             onClick={() => { if (targetPath !== null) onOpen(targetPath) }}
+           >
+-            {t('browser.open')}
++            {confirmLabel ?? t('browser.open')}
+           </Button>
+         </div>
+       </div>
+diff --git a/packages/client/ui-directory-picker-browse/src/client/index.ts b/packages/client/ui-directory-picker-browse/src/client/index.ts
+index 9e7b2833ea75700c1d429203996d032c61853ba0..e9a70a36bf06eabf89b6f1ab6e170c5534f9326e 100644
+--- a/packages/client/ui-directory-picker-browse/src/client/index.ts
++++ b/packages/client/ui-directory-picker-browse/src/client/index.ts
+@@ -8,7 +8,48 @@
+  * capability kind. The dialog's copy is locale-registered here — the flow
+  * package owns its own strings.
+  */
+-import type { Context as ClientContext } from '@deepseek-ai/cordis'
++import { Service, type Context as ClientContext } from '@deepseek-ai/cordis'
++import { createElement, type ReactElement } from 'react'
++import { DirectoryBrowser } from './DirectoryBrowser.tsx'
++export { DirectoryBrowser, type DirectoryBrowserProps } from './DirectoryBrowser.tsx'
++
++/** Stable owner-facing contract; browsing and localization stay in this package. */
++export interface DirectoryBrowserRenderProps {
++  open: boolean
++  busy: boolean
++  initialPath?: string
++  title?: string
++  confirmLabel?: string
++  onPicked: (path: string) => void
++  onCancel: () => void
++}
++
++declare module '@deepseek-ai/cordis' {
++  interface Context {
++    /** Shared Host-backed directory browser for Client plugin surfaces. */
++    directoryBrowser: DirectoryBrowserService
++  }
++}
++
++/** Public Client service: render the same browser used by workspace selection. */
++export class DirectoryBrowserService extends Service {
++  constructor(ctx: ClientContext) { super(ctx, 'directoryBrowser') }
++
++  private readonly listDirectory = (path?: string, signal?: AbortSignal) => this.ctx.uiWorkspace.listDirectory(path, signal)
++  private readonly createDirectory = (path: string, name: string) => this.ctx.uiWorkspace.createDirectory(path, name)
++
++  /** Render an owner-controlled dialog; callbacks and busy state belong to the caller. */
++  render(props: DirectoryBrowserRenderProps): ReactElement {
++    return createElement(DirectoryBrowser, {
++      ...props,
++      onOpen: props.onPicked,
++      onClose: props.onCancel,
++      listDirectory: this.listDirectory,
++      createDirectory: this.createDirectory,
++      t: this.ctx.locale.bind('directory-browser'),
++    })
++  }
++}
+ // Type-only: pulls the SlotMap merge declaring the directory-flow holes.
+ import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
+ // Type-only: pulls the SlotRegistry service merge (ctx.slots).
+@@ -29,6 +70,7 @@ export const inject = ['slots', 'uiWorkspace', 'locale']
+  * @param ctx - client root context.
+  */
+ export function apply(ctx: ClientContext): void {
++  ctx.plugin(DirectoryBrowserService)
+   ctx.effect(() => {
+     // The two dictionaries land as a unit: if the second registration hits a
+     // rival owner of the namespace, the first rolls back before the throw —
+@@ -38,6 +80,7 @@ export function apply(ctx: ClientContext): void {
+       ['zh', {
+         'browser.title': '选择工作区目录',
+         'browser.home': '主目录',
++        'browser.location': '盘符 / 位置',
+         'browser.newFolder': '新建文件夹',
+         'browser.folderName': '文件夹名称',
+         'browser.createIn': '在"{name}"中新建文件夹',
+@@ -53,6 +96,7 @@ export function apply(ctx: ClientContext): void {
+       ['en', {
+         'browser.title': 'Select Workspace Directory',
+         'browser.home': 'Home',
++        'browser.location': 'Drive / location',
+         'browser.newFolder': 'New folder',
+         'browser.folderName': 'Folder name',
+         'browser.createIn': 'New folder in "{name}"',
+diff --git a/packages/client/ui-directory-picker-browse/tests/client-flow.client.spec.tsx b/packages/client/ui-directory-picker-browse/tests/client-flow.client.spec.tsx
+index 782ae4d5337b38726d30641706f7498a868d53e3..d77e5dfb713b748053cdf70577fb881ca76253cb 100644
+--- a/packages/client/ui-directory-picker-browse/tests/client-flow.client.spec.tsx
++++ b/packages/client/ui-directory-picker-browse/tests/client-flow.client.spec.tsx
+@@ -52,6 +52,22 @@ function owner(overrides: Partial<DirectoryFlowOwnerProps> = {}): DirectoryFlowO
+ }
+ 
+ describe('directory-picker-browse client half', () => {
++  it('publishes a lifecycle-owned browser service with injected operations and owner pick semantics', async () => {
++    const b = await bench()
++    const fiber = b.ctx.plugin({ inject: [...inject], apply })
++    await fiber.await()
++    const service = b.ctx.directoryBrowser
++    const onPicked = vi.fn()
++    render(service.render({ open: true, busy: false, title: '可信目录', confirmLabel: '选择目录', onPicked, onCancel: vi.fn() }))
++    await screen.findByText('Documents')
++    fireEvent.click(screen.getByRole('button', { name: '选择目录' }))
++    expect(onPicked).toHaveBeenCalledWith(HOME)
++    expect(b.listDirectory).toHaveBeenCalledWith(undefined, expect.any(AbortSignal))
++    cleanup()
++    await fiber.dispose()
++    expect(b.ctx.get('directoryBrowser')).toBeUndefined()
++  })
++
+   it('declares the services it drives', () => {
+     expect(inject).toEqual(['slots', 'uiWorkspace', 'locale'])
+   })
+diff --git a/packages/client/ui-directory-picker-browse/tests/directory-browser.client.spec.tsx b/packages/client/ui-directory-picker-browse/tests/directory-browser.client.spec.tsx
+index 5f386c8723ab23e491b8582df1abe75a4695779b..8f066beecd5d2d6e36d22631d6eb2af014d1f183 100644
+--- a/packages/client/ui-directory-picker-browse/tests/directory-browser.client.spec.tsx
++++ b/packages/client/ui-directory-picker-browse/tests/directory-browser.client.spec.tsx
+@@ -115,6 +115,39 @@ function rowButton(item: HTMLElement): HTMLButtonElement {
+ }
+ 
+ describe('DirectoryBrowser', () => {
++  it('accepts owner copy and initial path without changing Miller selection semantics', async () => {
++    const b = mount({ initialPath: DOCS, title: 'Choose trusted directory', confirmLabel: 'Trust directory' })
++    await waitFor(() => { expect(columns()).toHaveLength(2) })
++    expect(b.listDirectory).toHaveBeenCalledWith(DOCS, expect.any(AbortSignal))
++    expect(screen.getByRole('dialog').getAttribute('aria-label')).toBe('Choose trusted directory')
++    fireEvent.click(screen.getByRole('button', { name: 'Trust directory' }))
++    expect(b.onOpen).toHaveBeenCalledWith(DOCS)
++  })
++
++  it('uses only Host roots for drive/location navigation and retains the last readable view on failure', async () => {
++    const home = { ...listingFor(), roots: [
++      { name: 'C:\\', path: 'C:\\', hidden: false },
++      { name: 'Z:\\', path: 'Z:\\', hidden: false },
++    ] }
++    const listDirectory = vi.fn(async (path?: string) => {
++      if (path === 'C:\\') return { ...home, path, crumbs: [{ name: path, path, hidden: false }], entries: [] }
++      if (path === 'Z:\\') throw new Error('drive offline')
++      return home
++    })
++    const b = mount({ listDirectory })
++    const locations = await screen.findByRole('combobox', { name: 'browser.location' })
++    expect(within(locations).getAllByRole('option').map(option => option.textContent))
++      .toEqual(['browser.location', 'browser.home', 'C:\\', 'Z:\\'])
++    expect(listDirectory).toHaveBeenCalledTimes(1)
++    fireEvent.change(locations, { target: { value: 'Z:\\' } })
++    await screen.findByText('drive offline')
++    expect(screen.getByRole('listitem').textContent).toBe('Documents')
++    fireEvent.change(locations, { target: { value: 'C:\\' } })
++    await waitFor(() => { expect(screen.queryAllByRole('listitem')).toHaveLength(0) })
++    fireEvent.click(screen.getByRole('button', { name: 'browser.open' }))
++    expect(b.onOpen).toHaveBeenCalledWith('C:\\')
++  })
++
+   it('renders nothing and launches no listing while initially closed', () => {
+     const b = mount({ open: false })
+     expect(screen.queryByRole('dialog')).toBeNull()
+diff --git a/packages/host/directory-picker-browse/src/index.ts b/packages/host/directory-picker-browse/src/index.ts
+index 01fe5b9cd23e9c3318ed94db4f0f4a1488e46ba5..fb89b4c74e141e677ddf1836b1f25325a15fd84f 100644
+--- a/packages/host/directory-picker-browse/src/index.ts
++++ b/packages/host/directory-picker-browse/src/index.ts
+@@ -9,6 +9,7 @@
+  * @module @deepseek-ai/dsh-host-directory-picker-browse
+  */
+ 
++import { execFile } from 'node:child_process'
+ import { mkdir, opendir, stat } from 'node:fs/promises'
+ import { homedir } from 'node:os'
+ import { basename, dirname, join, posix, resolve, win32 } from 'node:path'
+@@ -53,6 +54,27 @@ export function fullyQualified(path: string, platform: NodeJS.Platform = process
+     : posix.isAbsolute(path)
+ }
+ 
++/**
++ * Enumerate actual OS roots without scanning guessed letters or opening drives.
++ * Windows' GetLogicalDrives uses the OS logical-drive table, including mapped
++ * drives and removable media; readiness is checked only if the user enters one.
++ * The fixed command contains no caller-controlled text and needs no profile.
++ * @param platform - platform override for deterministic POSIX tests.
++ * @param signal - caller lifetime; terminates the enumeration subprocess.
++ */
++export async function directoryRoots(platform: NodeJS.Platform = process.platform, signal?: AbortSignal): Promise<DirectoryEntry[]> {
++  signal?.throwIfAborted()
++  if (platform !== 'win32') return [{ name: '/', path: '/', hidden: false }]
++  const executable = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
++  const output = await new Promise<string>((resolve, reject) => {
++    execFile(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '[Environment]::GetLogicalDrives()'], {
++      encoding: 'utf8', windowsHide: true, timeout: 3000, maxBuffer: 8192, signal,
++    }, (error, stdout) => { if (error) reject(asError(error)); else resolve(stdout) })
++  })
++  return [...new Set(output.split(/\r?\n/).map(value => value.trim()).filter(value => /^[A-Za-z]:\\$/.test(value)))]
++    .sort().map(path => ({ name: path, path, hidden: false }))
++}
++
+ /** One streamed listing candidate: the dirent facts a row needs, nothing else retained. */
+ export interface ListingCandidate {
+   /** Base name within the streamed level. */
+@@ -196,6 +218,10 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
+     maxEntries: z.natural().min(1).default(1000),
+   })
+ 
++  // A short successful-result cache avoids spawning PowerShell on every Miller
++  // leg while still discovering newly mounted/unmounted drives during a session.
++  private rootsCache: { expires: number; entries: DirectoryEntry[] } | undefined
++
+   private readonly browseCapability: DirectoryPickerCapability = {
+     kind: 'browse',
+     list: (path, signal) => this.list(path, signal),
+@@ -293,7 +319,16 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
+       }
+       entries.push(row)
+     }
+-    return { path: target, home, crumbs: ancestryCrumbs(target), entries, truncated }
++    // Enumeration failure must not hide an otherwise readable directory. Old
++    // and restricted Hosts can still browse through crumbs and the path editor.
++    let roots = this.rootsCache?.expires !== undefined && this.rootsCache.expires > Date.now()
++      ? this.rootsCache.entries : undefined
++    if (roots === undefined) {
++      roots = await directoryRoots(process.platform, signal).catch(() => undefined)
++      if (roots !== undefined) this.rootsCache = { expires: Date.now() + 10_000, entries: roots }
++    }
++    signal?.throwIfAborted()
++    return { path: target, home, crumbs: ancestryCrumbs(target), entries, truncated, ...(roots === undefined ? {} : { roots }) }
+   }
+ 
+   private async createDirectory(path: string, name: string): Promise<string> {
+diff --git a/packages/host/directory-picker-browse/tests/service.spec.ts b/packages/host/directory-picker-browse/tests/service.spec.ts
+index a96984563632634ebbb3139869d2f5fe8c492829..522a65d2526cbc9c3ef3bbceb5147e218fc02f98 100644
+--- a/packages/host/directory-picker-browse/tests/service.spec.ts
++++ b/packages/host/directory-picker-browse/tests/service.spec.ts
+@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+ import { Context } from '@deepseek-ai/cordis'
+ import { DirectoryPickerError } from '@deepseek-ai/dsh-host-directory-picker'
+ import type { DirectoryPickerBrowseCapability } from '@deepseek-ai/dsh-host-directory-picker'
+-import BrowseDirectoryPicker, { boundedInsert, fullyQualified, raceAbort } from '../src/index.ts'
++import BrowseDirectoryPicker, { boundedInsert, directoryRoots, fullyQualified, raceAbort } from '../src/index.ts'
+ import type { ListingCandidate } from '../src/index.ts'
+ 
+ let root: string
+@@ -45,6 +45,18 @@ afterAll(async () => {
+ })
+ 
+ describe('BrowseDirectoryPicker', () => {
++  it('enumerates real OS roots and includes them in listings without probing drive readiness', async () => {
++    expect(await directoryRoots('linux')).toEqual([{ name: '/', path: '/', hidden: false }])
++    const roots = await directoryRoots()
++    expect(roots.length).toBeGreaterThan(0)
++    expect(roots.every(root => fullyQualified(root.path) && root.name === root.path && !root.hidden)).toBe(true)
++    const listing = await capability.list(root)
++    expect(listing.roots).toEqual(roots)
++    const aborted = new AbortController()
++    aborted.abort(new Error('roots caller left'))
++    await expect(directoryRoots(process.platform, aborted.signal)).rejects.toThrow('roots caller left')
++  })
++
+   it('lists directories only, flags hidden rows, follows symlinks, skips broken links, sorts by name', async () => {
+     const listing = await capability.list(root)
+     expect(listing.path).toBe(root)
+diff --git a/packages/host/directory-picker/src/types.ts b/packages/host/directory-picker/src/types.ts
+index db1dda57db1669e5899713123bba56c97911ffab..a22c5b8f99a9cfec0564111f77346437d50fd9fc 100644
+--- a/packages/host/directory-picker/src/types.ts
++++ b/packages/host/directory-picker/src/types.ts
+@@ -28,6 +28,12 @@ export interface DirectoryListing {
+    * inclusive; every crumb is a jump target (crumb `hidden` is always false).
+    */
+   crumbs: DirectoryEntry[]
++  /**
++   * Host-enumerated filesystem locations (Windows logical drives, POSIX `/`).
++   * Optional for older or custom backends; clients must not probe guessed drives.
++   * A root may be temporarily unreadable (for example removable media).
++   */
++  roots?: DirectoryEntry[]
+   /** Direct child directories, name-sorted; symlinks to directories included. */
+   entries: DirectoryEntry[]
+   /**

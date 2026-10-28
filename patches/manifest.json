@@ -1,9 +1,12 @@
 {
   "upstream": "https://github.com/deepseek-ai/deepseek-harness.git",
   "baselineCommit": "1f81c047fc48fa190a683e469daa699857e9afe8",
-  "patchedTree": "965e6535873508bbe9064626e47a49fd33090917",
+  "patchedTree": "427e4c2a41d9bb2f21f73dc7438899c6616b566c",
   "patch": "harness-trusted-paths.patch",
-  "sha256": "aa4d68da0a12e27b18240472c9ebbce162282a69ef22c1b82764795656abcda5",
+  "sha256": "a2d92a19bb15fdd16e5373476dcc07a5a38c54050267a7a51eda35ca4781fe32",
+  "upgradePatch": "harness-trusted-paths-0.1.1-to-0.2.0.patch",
+  "upgradeFromTree": "965e6535873508bbe9064626e47a49fd33090917",
+  "upgradeSha256": "e310c593b866e0f169731b7a9241332185d9cd8bb249f1fb6b5592a491a7ea76",
   "files": [
     "packages/api/session-controller/src/commands.ts",
     "packages/api/session-controller/tests/commands-create-fork.host.spec.ts",
@@ -13,6 +16,13 @@
     "packages/api/workspace-controller/src/types.ts",
     "packages/api/workspace-controller/tests/model.client.spec.ts",
     "packages/api/workspace-controller/tests/workspace-controller.host.spec.ts",
+    "packages/client/ui-directory-picker-browse/README.md",
+    "packages/client/ui-directory-picker-browse/README.zh.md",
+    "packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.module.css",
+    "packages/client/ui-directory-picker-browse/src/client/DirectoryBrowser.tsx",
+    "packages/client/ui-directory-picker-browse/src/client/index.ts",
+    "packages/client/ui-directory-picker-browse/tests/client-flow.client.spec.tsx",
+    "packages/client/ui-directory-picker-browse/tests/directory-browser.client.spec.tsx",
     "packages/client/ui-workspace/src/client/contract/slots.ts",
     "packages/client/ui-workspace/src/client/index.ts",
     "packages/client/ui-workspace/src/client/rows/Rows.tsx",
@@ -22,6 +32,9 @@
     "packages/fs/fs-local/tests/fsio.spec.ts",
     "packages/fs/fs-sandbox/src/index.ts",
     "packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts",
+    "packages/host/directory-picker-browse/src/index.ts",
+    "packages/host/directory-picker-browse/tests/service.spec.ts",
+    "packages/host/directory-picker/src/types.ts",
     "packages/sandbox/sandbox-local/src/index.ts",
     "packages/sandbox/sandbox-local/src/profiles.ts",
     "packages/sandbox/sandbox-local/tests/local.spec.ts",
@@ -43,5 +56,5 @@
     "packages/sandbox/sandbox-windows-acl/src/extra-root-lease.ts",
     "packages/sandbox/sandbox-windows-acl/tests/extra-root-lease.spec.ts"
   ],
-  "verification": "git apply --cached --check and apply against baseline blobs, followed by git diff --cached --check"
+  "verification": "Full baseline and incremental old tree git apply --cached --check and apply both produce patchedTree"
 }
