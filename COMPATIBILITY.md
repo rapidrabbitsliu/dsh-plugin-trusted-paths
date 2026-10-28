@@ -2,6 +2,8 @@
 
 This release requires a custom DeepSeek Harness runtime. It does not patch the runtime during installation. A stock runtime with the same version string is not necessarily compatible. No official minimum compatible release is known.
 
+**Platform support:** the supplied runtime patch currently implements the full revoke/reconcile lifecycle on Windows only. Linux/macOS implementations explicitly reject nonempty extra-root lifecycle operations. This release is not a complete cross-platform solution. Pending reservations, crashed runners and abandoned lock directories do not automatically expire; manual recovery requires proof that related token processes have terminated.
+
 Required contracts:
 
 1. Host `sandboxPolicy.registerWritableRoots(provider)` returning an effect disposer. Additional roots must only extend `workspace-write`, never `read-only`.
@@ -23,4 +25,6 @@ The package checks missing sandbox methods and refuses activation rather than di
 - `packages/settings/settings`
 - `packages/client/ui-workspace`
 
-The runtime changes are separate from this plugin repository. This release does not claim those changes have been accepted upstream or included in an official release. Do not enable on an unverified runtime or bypass version/compatibility checks to force activation.
+Starting with v0.1.1, the complete runtime patch is included at `patches/harness-trusted-paths.patch`, based on upstream commit `1f81c047fc48fa190a683e469daa699857e9afe8`. Follow [INSTALL-CORE.md](./INSTALL-CORE.md) for exact checkout, patch application, build, startup and verification instructions. The patch is also shipped in the npm tarball and GitHub Release. It is not automatically applied during plugin installation.
+
+These changes have not been claimed as accepted upstream or included in an official release. Do not enable on an unverified runtime or bypass version/compatibility checks to force activation.

@@ -1,0 +1,3 @@
+# Preserve patch bytes/checksums; unified diff context includes single-space lines.
+patches/*.patch -text -whitespace
+patches/*.json text eol=lf

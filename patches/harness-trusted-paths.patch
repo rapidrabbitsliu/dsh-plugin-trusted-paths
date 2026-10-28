@@ -1,0 +1,1825 @@
+diff --git a/packages/api/session-controller/src/commands.ts b/packages/api/session-controller/src/commands.ts
+index 8dd38573c8bb79dfed0e675f95e0848da9bb1381..d7be057c99480eabdf3c1887a8a5853401436619 100644
+--- a/packages/api/session-controller/src/commands.ts
++++ b/packages/api/session-controller/src/commands.ts
+@@ -121,7 +121,7 @@ export class SessionCommandController {
+         })
+       }
+     }
+-    const cwd = workspace?.path ?? request.cwd ?? this.defaultCwd
++    const cwd = workspace?.defaultDirectory ?? workspace?.path ?? request.cwd ?? this.defaultCwd
+     let created: ApiSessionCreated
+     try {
+       created = await this.agents.createSession({
+diff --git a/packages/api/session-controller/tests/commands-create-fork.host.spec.ts b/packages/api/session-controller/tests/commands-create-fork.host.spec.ts
+index f43ce3f116f17ee0b89028cdd1818639b5e0d9d9..1f084d159d11a21c650118aa7c77aab7a7131974 100644
+--- a/packages/api/session-controller/tests/commands-create-fork.host.spec.ts
++++ b/packages/api/session-controller/tests/commands-create-fork.host.spec.ts
+@@ -73,6 +73,29 @@ describe('Session creation failures', () => {
+     await ctx.fiber.dispose()
+   })
+ 
++  it('uses a Workspace default only for newly created sessions, keeping old cwd immutable', async () => {
++    const ctx = await baseContext()
++    const old = ctx.sessions.create(SessionId('old-workspace-session'), { meta: { cwd: '/identity' } })
++    const attachSession = vi.fn(() => Promise.resolve())
++    const workspace = {
++      id: 'workspace-1' as WorkspaceId,
++      path: '/identity',
++      defaultDirectory: '/new-default',
++      sessionIds: [old.id],
++      attachSession,
++    } as unknown as Workspace
++    ctx.provide('workspaceRegistry', { get: () => workspace, list: () => [workspace], archivedSessionIds: [] } as never)
++    const createSession = vi.fn(publishedSession(ctx, SessionId('new-workspace-session')))
++    const controller = new SessionCommandController(ctx, controllerAgents(ctx, { createSession }), '/fallback')
++    await controller.create({ workspaceId: workspace.id })
++    expect(createSession.mock.calls[0]?.[0].cwd).toBe('/new-default')
++    expect(ctx.sessions.get(SessionId('new-workspace-session'))?.header.cwd).toBe('/new-default')
++    expect(old.header.cwd).toBe('/identity')
++    expect(workspace.path).toBe('/identity')
++    expect(attachSession).toHaveBeenCalledWith(SessionId('new-workspace-session'))
++    await ctx.fiber.dispose()
++  })
++
+   it('maps missing Workspaces and attachment failures', async () => {
+     const missing = await baseContext()
+     missing.provide('workspaceRegistry', { get: () => undefined, list: () => [] } as never)
+diff --git a/packages/api/workspace-controller/src/commands.ts b/packages/api/workspace-controller/src/commands.ts
+index c3a63f0cff71a0209d13f82e2a2744fb677de922..242991c121408ffd8e9c394c4392abb47755eb32 100644
+--- a/packages/api/workspace-controller/src/commands.ts
++++ b/packages/api/workspace-controller/src/commands.ts
+@@ -25,6 +25,7 @@ import type {
+   WorkspacePinSessionRequest,
+   WorkspacePinValue,
+   WorkspaceRenameRequest,
++  WorkspaceSetDefaultDirectoryRequest,
+   WorkspaceUnarchiveSessionRequest,
+   WorkspaceUnpinSessionRequest,
+   WorkspaceValue,
+@@ -90,6 +91,25 @@ export class WorkspaceCommands {
+     })
+   }
+ 
++  /**
++   * Change the default cwd without changing existing session headers or identity.
++   * @param request - Workspace identity and fully qualified existing directory.
++   * @returns the updated Workspace projection.
++   */
++  setDefaultDirectory(request: WorkspaceSetDefaultDirectoryRequest): Promise<WorkspaceValue> {
++    return this.enqueue(async () => {
++      const workspace = this.requireWorkspace(request.workspaceId)
++      try {
++        await workspace.setDefaultDirectory(request.path)
++      } catch (error) {
++        throw new RemoteError('workspace/invalid-path',
++          `cannot set Workspace default directory to "${request.path}": ${errorMessage(error)}`,
++          { path: request.path }, { cause: error })
++      }
++      return { workspace: workspaceView(workspace) }
++    })
++  }
++
+   /**
+    * Delete one Workspace registration without deleting its directory or Sessions.
+    * @param request - Workspace identity to remove.
+diff --git a/packages/api/workspace-controller/src/feed.ts b/packages/api/workspace-controller/src/feed.ts
+index be1cbdb21ce37e97c55d4a0167ef7681a463ceab..6a30a78f216a42aa17aec61f0e488783b124edab 100644
+--- a/packages/api/workspace-controller/src/feed.ts
++++ b/packages/api/workspace-controller/src/feed.ts
+@@ -27,6 +27,7 @@ export function workspaceView(workspace: Workspace): WorkspaceView {
+   return {
+     workspaceId: workspace.id,
+     path: workspace.path,
++    defaultDirectory: workspace.defaultDirectory ?? workspace.path,
+     title: workspace.title,
+     sessionIds: [...workspace.sessionIds],
+     createdAt: workspace.createdAt,
+@@ -39,6 +40,7 @@ function changedWorkspaceView(workspaceId: string, value: unknown): WorkspaceVie
+   return {
+     workspaceId: WorkspaceId(workspaceId),
+     path: record.path,
++    defaultDirectory: record.defaultDirectory ?? record.path,
+     title: record.title,
+     sessionIds: [...record.sessionIds],
+     createdAt: record.createdAt,
+diff --git a/packages/api/workspace-controller/src/index.ts b/packages/api/workspace-controller/src/index.ts
+index f275eb3d121b1f69dc47de1d096c56bcbfd5d09c..f1b6a15be7582e7d4d79a8e3fd68ab08433acb9f 100644
+--- a/packages/api/workspace-controller/src/index.ts
++++ b/packages/api/workspace-controller/src/index.ts
+@@ -25,6 +25,7 @@ import type {
+   WorkspacePinSessionRequest,
+   WorkspacePinValue,
+   WorkspaceRenameRequest,
++  WorkspaceSetDefaultDirectoryRequest,
+   WorkspaceUnarchiveSessionRequest,
+   WorkspaceUnpinSessionRequest,
+   WorkspaceValue,
+@@ -121,6 +122,16 @@ export class WorkspaceController extends TypertRemoteService {
+     return this.commands.rename(request)
+   }
+ 
++  /**
++   * Set the directory used only when creating future Workspace sessions.
++   * @param request - Workspace identity and fully qualified existing directory.
++   * @returns the updated Workspace projection, retaining its identity path.
++   */
++  @Remote('setDefaultDirectory')
++  setDefaultDirectory(request: WorkspaceSetDefaultDirectoryRequest): Promise<WorkspaceValue> {
++    return this.commands.setDefaultDirectory(request)
++  }
++
+   /**
+    * Remove one Workspace registration while retaining files and Sessions.
+    * @param request - Workspace identity to remove.
+diff --git a/packages/api/workspace-controller/src/types.ts b/packages/api/workspace-controller/src/types.ts
+index cdf9adf073ad2f0fcd7c40be66811425b34d31e8..8c8ab46ef568c526f01e01b5042eca7339fddcf9 100644
+--- a/packages/api/workspace-controller/src/types.ts
++++ b/packages/api/workspace-controller/src/types.ts
+@@ -19,6 +19,8 @@ export interface WorkspaceView {
+   readonly workspaceId: WorkspaceId
+   /** Canonical host directory path. */
+   readonly path: string
++  /** Canonical cwd for new sessions; older peers fall back to path. */
++  readonly defaultDirectory?: string
+   /** User-visible title. */
+   readonly title: string
+   /** Sessions accounted to this Workspace in manual order. */
+@@ -78,6 +80,12 @@ export interface WorkspaceRenameRequest {
+   readonly title: string
+ }
+ 
++/** Change only the working directory used by future Workspace sessions. */
++export interface WorkspaceSetDefaultDirectoryRequest {
++  readonly workspaceId: WorkspaceId
++  readonly path: string
++}
++
+ /** Workspace mutation returning the complete changed row. */
+ export interface WorkspaceValue {
+   readonly workspace: WorkspaceView
+diff --git a/packages/api/workspace-controller/tests/model.client.spec.ts b/packages/api/workspace-controller/tests/model.client.spec.ts
+index 9660b2ead877c41ea9d70bce8169f791c2c6fcef..1a7f734caf75a1d6f542c9f1290a10d85b9c9002 100644
+--- a/packages/api/workspace-controller/tests/model.client.spec.ts
++++ b/packages/api/workspace-controller/tests/model.client.spec.ts
+@@ -70,6 +70,9 @@ function deferred<T>(): Deferred<T> {
+ 
+ class FakeWorkspaceRemote implements WorkspaceRemote {
+   readonly initializeDefault = vi.fn<WorkspaceRemote['initializeDefault']>(async () => remoteOk({ workspace: workspace('default') }))
++  readonly setDefaultDirectory = vi.fn<WorkspaceRemote['setDefaultDirectory']>(async request => remoteOk({
++    workspace: { ...workspace(String(request.workspaceId)), defaultDirectory: request.path },
++  }))
+   readonly calls: Array<{ readonly method: string; readonly request: unknown }> = []
+   onCreate: (request: WorkspaceCreateRequest) => Promise<RemoteResult<WorkspaceCreateValue>> = request =>
+     Promise.resolve(remoteOk({ workspace: workspace(request.path.split('/').pop() ?? 'workspace'), created: true }))
+diff --git a/packages/api/workspace-controller/tests/workspace-controller.host.spec.ts b/packages/api/workspace-controller/tests/workspace-controller.host.spec.ts
+index c00531e06d4d19278d274bf90729d895aa954d33..d2e7db449ba8dc3866e95e2a94e3b9482907c210 100644
+--- a/packages/api/workspace-controller/tests/workspace-controller.host.spec.ts
++++ b/packages/api/workspace-controller/tests/workspace-controller.host.spec.ts
+@@ -137,6 +137,21 @@ describe('WorkspaceController commands', () => {
+     })
+   })
+ 
++  it('sets a future-session default without changing identity and maps invalid defaults', async () => {
++    const { controller, ctx, root } = await harness()
++    const path = stageDir(root, 'identity')
++    const next = stageDir(root, 'new-default')
++    const { workspace } = await controller.create({ path })
++    expect(workspace.defaultDirectory).toBe(path)
++    const changed = await controller.setDefaultDirectory({ workspaceId: workspace.workspaceId, path: next })
++    expect(changed.workspace).toMatchObject({ path, defaultDirectory: next, workspaceId: workspace.workspaceId })
++    expect(ctx.workspaceRegistry.get(workspace.workspaceId)?.defaultDirectory).toBe(next)
++    await expect(controller.setDefaultDirectory({ workspaceId: workspace.workspaceId, path: 'relative' }))
++      .rejects.toMatchObject({ code: 'workspace/invalid-path' })
++    await expect(controller.setDefaultDirectory({ workspaceId: 'missing' as WorkspaceId, path: next }))
++      .rejects.toMatchObject({ code: 'workspace/not-found' })
++  })
++
+   it('maps invalid paths, blank names, conflicts, and unknown ids to stable failures', async () => {
+     const { controller, root } = await harness()
+     const first = await controller.create({ path: stageDir(root, 'first') })
+diff --git a/packages/client/ui-workspace/src/client/contract/slots.ts b/packages/client/ui-workspace/src/client/contract/slots.ts
+index d00b3658d82e30f6efea26adbadb1b4533a67868..c18187f4240586aa185fa0d6df6b62c2316c8f05 100644
+--- a/packages/client/ui-workspace/src/client/contract/slots.ts
++++ b/packages/client/ui-workspace/src/client/contract/slots.ts
+@@ -82,6 +82,16 @@ export interface SessionRowOwnerProps {
+   displayTitle: string
+ }
+ 
++/** Owner share of one real Workspace header's menu. */
++export interface WorkspaceRowOwnerProps {
++  /** Workspace the header shows. */
++  workspaceId: WorkspaceId
++  /** Absolute Host directory path, without display abbreviation. */
++  path: string
++  /** Localized display title shown by the header. */
++  displayTitle: string
++}
++
+ /** The row menu's open state as its owner holds it: the `useState` pair. */
+ export type MenuOpenState = readonly [open: boolean, setOpen: (open: boolean) => void]
+ 
+@@ -103,6 +113,15 @@ export type UseMenuOpenState = () => MenuOpenState
+ export const menuOpenStateFactory: SlotHookFactory<'sidebar.workspaces.session.menu.item', UseMenuOpenState> =
+   (_standard, state) => () => state
+ 
++/**
++ * Bind a Workspace menu occurrence's state to its entries' dismissal hook.
++ * @param _standard - framework standard props (unused).
++ * @param state - the menu's open-state pair from the render occurrence.
++ * @returns the hook the entry calls.
++ */
++export const workspaceMenuOpenStateFactory: SlotHookFactory<'sidebar.workspaces.workspace.menu.item', UseMenuOpenState> =
++  (_standard, state) => () => state
++
+ /**
+  * Owner share of the two Session-row schedule seats. Both receive only the
+  * row's Session identity: the occupant reads that Session's own scheduled
+@@ -134,6 +153,22 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
+      * its trailing status line. Mounted only while that card is open.
+      */
+     'sidebar.session.row.hover': { kind: 'list'; scope: 'root'; owner: SessionRowScheduleOwnerProps }
++    /**
++     * Plugin rows of a real Workspace header's "..." menu, in ascending
++     * `order`, before the built-in Rename and Delete rows. No occurrence is
++     * rendered for the ungrouped bucket. Entries render `MenuItemButton` (or
++     * another `role="menuitem"` button), own their actions, and dismiss through
++     * the injected `useMenuOpenState` hook's `setOpen(false)`.
++     */
++    'sidebar.workspaces.workspace.menu.item': {
++      kind: 'list'
++      scope: 'root'
++      owner: WorkspaceRowOwnerProps
++      hookContext: MenuOpenState
++      inject: { hooks: {
++        menuOpenState: SlotHookFactory<'sidebar.workspaces.workspace.menu.item', UseMenuOpenState>
++      } }
++    }
+     /**
+      * The rows of one Session's "..." menu, in ascending `order`. ui-workspace
+      * registers the shipped rows here — `pin` (100), `rename` (200), `fork`
+@@ -469,6 +504,7 @@ export type WorkspaceBrowserProps =
+   PropsRuntime<'sidebar.workspaces'>
+   & PropsRenderSlots<
+     | 'sidebar.workspaces.directoryFlow'
++    | 'sidebar.workspaces.workspace.menu.item'
+     | 'sidebar.workspaces.session.menu.item'
+     | 'sidebar.workspaces.session.row.action'
+     | 'sidebar.session.row.leading'
+diff --git a/packages/client/ui-workspace/src/client/index.ts b/packages/client/ui-workspace/src/client/index.ts
+index cc9da072c9bd8053baf4a3551b61069ce594fd6b..79d7e54b2573508f3f94b136d29322b0a764cb1b 100644
+--- a/packages/client/ui-workspace/src/client/index.ts
++++ b/packages/client/ui-workspace/src/client/index.ts
+@@ -38,7 +38,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
+ // Type-only: pulls the Session root standard-hook merge.
+ import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+ import {
+-  type ArchiveSessionInjected, type ForkSessionInjected, menuOpenStateFactory, type PinSessionInjected,
++  type ArchiveSessionInjected, type ForkSessionInjected, menuOpenStateFactory, workspaceMenuOpenStateFactory, type PinSessionInjected,
+   type SessionArchiveConfirmInjected, type SessionArchiveConfirmRequest,
+   type RenameSessionInjected, type RowToast, type RowToastInjected, type RowToastState, type SessionRenameDialogInjected,
+   type SessionIdInjected, type WorkspaceBrowserInjected, type WorkspacePickerInjected,
+@@ -62,7 +62,7 @@ export type { StartSessionOptions, UiWorkspace } from './navigation.ts'
+ export type {
+   DirectoryFlowOwnerProps, DirectoryFlowSlotName, DirectoryPickingHooks, DirectoryPickingInjected,
+   MenuOpenState, RowToast, SessionRenameTarget, SessionRowOwnerProps, UseMenuOpenState, WorkspaceBrowserInjected,
+-  SessionRowScheduleOwnerProps,
++  SessionRowScheduleOwnerProps, WorkspaceRowOwnerProps,
+   WorkspaceBrowserProps,
+   WorkspacePickerInjected, WorkspacePickerProps,
+ } from './contract/slots.ts'
+@@ -297,6 +297,9 @@ export function apply(ctx: Context): void {
+         // Every row entry reads the menu's open state through a hook bound
+         // from the row's render occurrence (the owner passes the state pair
+         // as hookContext).
++        'sidebar.workspaces.workspace.menu.item': {
++          kind: 'list', scope: 'root', inject: { hooks: { menuOpenState: workspaceMenuOpenStateFactory } },
++        },
+         'sidebar.workspaces.session.menu.item': {
+           kind: 'list', scope: 'root', inject: { hooks: { menuOpenState: menuOpenStateFactory, shortcuts: ctx.shortcuts.catalog } },
+         },
+diff --git a/packages/client/ui-workspace/src/client/rows/Rows.tsx b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+index 216a6fc00f9b58db67b19c696562b01d61089457..89b0dcbc926a9e12da45bcb2d1e1218798404f2e 100644
+--- a/packages/client/ui-workspace/src/client/rows/Rows.tsx
++++ b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+@@ -3,7 +3,7 @@
+  * all data and callbacks arrive via props. Hover swaps (folder->chevron,
+  * time->ellipsis, action buttons) are CSS-only, and a session row's clipped
+  * title marquees programmatically while the row is hovered. Workspace row
+- * menus are visual-only except Rename/Delete. A Session row's "..." menu and
++ * menus render plugin entries before Rename/Delete. A Session row's "..." menu and
+  * its hover buttons are the `sidebar.workspaces.session.menu.item` and
+  * `sidebar.workspaces.session.row.action` lists, rendered through the
+  * browser's `renderSlot` with the menu's open state as the occurrence's hook
+@@ -18,7 +18,7 @@ import {
+   HoverCard, IconArchiveOutlineRegular, IconEditOutlineRegular,
+   IconEllipsisOutlineRegular, IconFolderCloseRegular, IconFolderOpenRegular,
+   IconNewChatOutlineRegular, IconPinFillRegular, IconTrashOutlineRegular,
+-  IconTriangleRightFillRegular, IconUnarchiveOutlineRegular, Menu, relativeTime, StateDot, Tooltip,
++  IconTriangleRightFillRegular, IconUnarchiveOutlineRegular, Menu, MenuItemButton, relativeTime, StateDot, Tooltip,
+ } from '@deepseek-ai/dsh-client-ui-primitives'
+ import type { ShortcutCatalogEntry } from '@deepseek-ai/dsh-client-shortcuts/client'
+ import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
+@@ -216,7 +216,8 @@ function rowHalf(e: { clientY: number; currentTarget: HTMLElement }): 'before' |
+  * @param props.t - the browser root's locale seat.
+  * @returns the row element.
+  */
+-export function ProjectRowItem({ group, containsCurrentDescendant = false, onToggle, onCreate, actions, drag, home, newShortcut, t }: {
++export function ProjectRowItem({ group, containsCurrentDescendant = false, onToggle, onCreate, actions, drag, home, newShortcut, renderSlot, t }: {
++  renderSlot: PropsRenderSlots<'sidebar.workspaces.workspace.menu.item'>['renderSlot']
+   group: GroupNode
+   newShortcut?: ShortcutCatalogEntry | undefined
+   containsCurrentDescendant?: boolean
+@@ -235,10 +236,7 @@ export function ProjectRowItem({ group, containsCurrentDescendant = false, onTog
+   const label = row.workspaceId === undefined ? t('group.ungrouped') : row.label
+   const active = containsCurrentDescendant || (group.expanded && group.containsCurrent)
+   const [menuOpen, setMenuOpen] = useState(false)
+-  const workspaceMenuItems = [
+-    { id: 'rename', label: t('rename'), icon: <IconEditOutlineRegular /> },
+-    { id: 'delete', label: t('delete.workspace'), icon: <IconTrashOutlineRegular />, danger: true },
+-  ]
++  const menuOpenState: MenuOpenState = [menuOpen, setMenuOpen]
+   const ownRow = (
+     <div
+       className={clsx(css.projectRow, menuOpen && css.menuOpen)}
+@@ -266,20 +264,10 @@ export function ProjectRowItem({ group, containsCurrentDescendant = false, onTog
+         <span className={css.title}>{label}</span>
+       </span>
+       <span className={css.rowActions}>
+-        {actions !== undefined && (
++        {actions !== undefined && row.workspaceId !== undefined && row.cwd !== undefined && (
+           <Menu
+             open={menuOpen}
+             onClose={() => { setMenuOpen(false) }}
+-            items={workspaceMenuItems}
+-            onSelect={(id) => {
+-              setMenuOpen(false)
+-              // Unknown ids leave before the dispatch: a future menu row must
+-              // not inherit the destructive branch as an else fallback.
+-              /* v8 ignore next -- Menu can emit only the rename and delete rows supplied above. */
+-              if (id !== 'rename' && id !== 'delete') return
+-              if (id === 'rename') actions.rename()
+-              else actions.delete()
+-            }}
+             portal
+             closeOnPointerLeave
+             anchor={(
+@@ -292,7 +280,19 @@ export function ProjectRowItem({ group, containsCurrentDescendant = false, onTog
+                 <IconEllipsisOutlineRegular />
+               </button>
+             )}
+-          />
++          >
++            {renderSlot(
++              'sidebar.workspaces.workspace.menu.item',
++              { workspaceId: row.workspaceId, path: row.cwd, displayTitle: label },
++              { hookContext: menuOpenState },
++            )}
++            <MenuItemButton icon={<IconEditOutlineRegular />} onSelect={() => { setMenuOpen(false); actions.rename() }}>
++              {t('rename')}
++            </MenuItemButton>
++            <MenuItemButton icon={<IconTrashOutlineRegular />} danger onSelect={() => { setMenuOpen(false); actions.delete() }}>
++              {t('delete.workspace')}
++            </MenuItemButton>
++          </Menu>
+         )}
+         <Tooltip label={t('actions.newSession')} shortcutKeys={newShortcut?.keys} side="bottom" align="end" delayMs={500} portal>
+           <button
+diff --git a/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx b/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
+index df871654ee16030fbe639a6748e77944a8f13904..46857b7a9055c9531f133fabfa435e2d23b949ae 100644
+--- a/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
++++ b/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
+@@ -255,6 +255,7 @@ type SessionTreeProps = Pick<
+   'useSessionStatus' | 'startSession' | 'open'
+   | 'insertWorkspaceBefore' | 't' | 'usePanelInfo'
+ > & PropsRenderSlots<
++  | 'sidebar.workspaces.workspace.menu.item'
+   | 'sidebar.workspaces.session.menu.item'
+   | 'sidebar.workspaces.session.row.action'
+   | 'sidebar.session.row.leading'
+@@ -555,6 +556,7 @@ function SessionTree({
+           }}
+       >
+         <ProjectRowItem
++          renderSlot={renderSlot}
+           newShortcut={shortcuts.find(row => row.id === 'session.new')}
+           group={group}
+           containsCurrentDescendant={currentAncestors.has(group.key)}
+diff --git a/packages/client/ui-workspace/tests/rows.client.spec.tsx b/packages/client/ui-workspace/tests/rows.client.spec.tsx
+index f02cf3ca853a6eb4040f89e35e5b049885596072..f1dbbb618e9527a91aec4067a7a4406d1efac78c 100644
+--- a/packages/client/ui-workspace/tests/rows.client.spec.tsx
++++ b/packages/client/ui-workspace/tests/rows.client.spec.tsx
+@@ -8,11 +8,11 @@ import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
+ import { en as commonEn } from '@deepseek-ai/dsh-client-locale/src/locales/en.ts'
+ import { HoverCardGroup, MenuItemButton, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+ import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
+-import type { MenuOpenState, SessionRowOwnerProps } from '../src/client/contract/slots.ts'
++import type { MenuOpenState, SessionRowOwnerProps, WorkspaceRowOwnerProps } from '../src/client/contract/slots.ts'
+ import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
+ import type { RowDragProps } from '../src/client/rows/Rows.tsx'
+ import {
+-  ProjectRowItem, SearchResultItem, SessionNodeItem as SessionNodeItemComponent,
++  ProjectRowItem as ProjectRowItemComponent, SearchResultItem, SessionNodeItem as SessionNodeItemComponent,
+ } from '../src/client/rows/Rows.tsx'
+ import type { GroupNode, SearchResultNode, SessionNode } from '../src/client/tree.ts'
+ import { en, zh } from '../src/client/locales.ts'
+@@ -43,6 +43,11 @@ function SessionNodeItem({ renderSlot = renderNoRowEntries, onRenameRequest = ()
+   return <SessionNodeItemComponent {...props} renderSlot={renderSlot} onRenameRequest={onRenameRequest} />
+ }
+ 
++type ProjectRowItemProps = ComponentProps<typeof ProjectRowItemComponent>
++function ProjectRowItem({ renderSlot = () => null, ...props }: Omit<ProjectRowItemProps, 'renderSlot'> & Partial<Pick<ProjectRowItemProps, 'renderSlot'>>) {
++  return <ProjectRowItemComponent {...props} renderSlot={renderSlot} />
++}
++
+ /** Half detection reads the row rect; jsdom rects are all-zero by default. */
+ function stubRect(row: HTMLElement): void {
+   row.getBoundingClientRect = () => ({
+@@ -510,6 +515,30 @@ describe('workspace browser rows', () => {
+     expect(screen.queryByRole('menu')).toBeNull()
+   })
+ 
++  it('workspace plugin menu rows precede Rename/Delete and can dismiss their own menu', () => {
++    const group: GroupNode = {
++      key: 'project', workspaceId: wid('project'), cwd: '/projects/project', createdAt: 0, label: 'Project',
++      sessionCount: 0, expanded: false, containsCurrent: false, sessions: [],
++    }
++    const seen = vi.fn()
++    const renderSlot: ProjectRowItemProps['renderSlot'] = (_name, owner, options) => {
++      seen(owner)
++      const [, setOpen] = options!.hookContext as MenuOpenState
++      return <MenuItemButton onSelect={() => { setOpen(false) }}>Plugin action</MenuItemButton>
++    }
++    const onRename = vi.fn()
++    const onDelete = vi.fn()
++    render(<ProjectRowItem group={group} onToggle={vi.fn()} onCreate={vi.fn()} t={t}
++      actions={{ rename: onRename, delete: onDelete }} renderSlot={renderSlot} />)
++    fireEvent.click(screen.getByRole('button', { name: '工作区“Project”的操作' }))
++    expect(screen.getAllByRole('menuitem').map(item => item.textContent)).toEqual(['Plugin action', '重命名', '删除工作区'])
++    expect(seen).toHaveBeenLastCalledWith({ workspaceId: wid('project'), path: '/projects/project', displayTitle: 'Project' } satisfies WorkspaceRowOwnerProps)
++    fireEvent.click(screen.getByRole('menuitem', { name: 'Plugin action' }))
++    expect(screen.queryByRole('menu')).toBeNull()
++    expect(onRename).not.toHaveBeenCalled()
++    expect(onDelete).not.toHaveBeenCalled()
++  })
++
+   it('workspace hover card shows its details and copies the full directory path', async () => {
+     vi.useFakeTimers()
+     const writeText = vi.fn(async () => {})
+diff --git a/packages/fs/fs-local/src/fsio.ts b/packages/fs/fs-local/src/fsio.ts
+index a9d97fd6ac2402de6c38712df13a47b348db5350..97071c427ea0783cabf808db6bf4e1405878e571 100644
+--- a/packages/fs/fs-local/src/fsio.ts
++++ b/packages/fs/fs-local/src/fsio.ts
+@@ -195,7 +195,30 @@ export async function resolveLocalTarget(cwd: string, path: string): Promise<Loc
+         }
+       }
+       /* v8 ignore stop */
+-      return { displayPath, targetKey: FsTargetKey(join(realAncestor, ...missing)) }
++      // A spelling can fail lookup before canonicalizing its parent (notably
++      // Windows AppData virtualization). Re-check every suffix component from
++      // the canonical ancestor: blindly appending it can retain a live junction
++      // in the supposedly canonical key and turn containment into an escape.
++      let canonical = realAncestor
++      for (let index = 0; index < missing.length; index++) {
++        const candidate = join(canonical, missing[index]!)
++        try {
++          canonical = await realpath(candidate)
++        } catch (error: unknown) {
++          if (!isENOENT(error)) throw error
++          // Only genuinely absent entries may form the unresolved suffix. A
++          // dangling/unresolvable symlink must fail closed, never be appended.
++          let entry: Stats | undefined
++          try {
++            entry = await lstat(candidate)
++          } catch (error: unknown) {
++            if (!isENOENT(error)) throw error
++          }
++          if (entry) throw new FsError(`cannot resolve "${displayPath}": an existing path segment cannot be canonicalized`, 'FS_NOT_FOUND')
++          return { displayPath, targetKey: FsTargetKey(join(canonical, ...missing.slice(index))) }
++        }
++      }
++      return { displayPath, targetKey: FsTargetKey(canonical) }
+     } catch (error: unknown) {
+       /* v8 ignore next -- native Windows coverage exercises the FsError raised by the repair above. */
+       if (error instanceof FsError) throw error
+diff --git a/packages/fs/fs-local/tests/fsio.spec.ts b/packages/fs/fs-local/tests/fsio.spec.ts
+index 40ed8363090955ebf192766d37380f7e7752535c..6febeaf96390a7ef3cd3cfc2c1bd4bd3dcfb66ac 100644
+--- a/packages/fs/fs-local/tests/fsio.spec.ts
++++ b/packages/fs/fs-local/tests/fsio.spec.ts
+@@ -89,6 +89,24 @@ describe('resolveLocalTarget', () => {
+     expect(before.targetKey).toBe(after.targetKey)
+   })
+ 
++  it('canonicalizes directory junctions before appending a missing suffix', async () => {
++    const destination = join(dir, 'destination')
++    await mkdir(destination)
++    await symlink(destination, join(dir, 'junction'), process.platform === 'win32' ? 'junction' : 'dir')
++    const canonicalDestination = (await resolveLocalTarget(dir, 'destination')).targetKey
++    for (const suffix of ['new.txt', 'missing/deep.txt']) {
++      expect((await resolveLocalTarget(dir, `junction/${suffix}`)).targetKey)
++        .toBe(join(canonicalDestination, suffix))
++    }
++  })
++
++  it('fails closed instead of appending an unresolvable directory symlink', async () => {
++    await symlink(join(dir, 'absent-target'), join(dir, 'dangling'), process.platform === 'win32' ? 'junction' : 'dir')
++    for (const suffix of ['', '/new.txt', '/missing/deep.txt']) {
++      await expect(resolveLocalTarget(dir, `dangling${suffix}`)).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
++    }
++  })
++
+   it('rejects a blank path', async () => {
+     await expect(resolveLocalTarget(dir, '   ')).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+   })
+diff --git a/packages/fs/fs-sandbox/src/index.ts b/packages/fs/fs-sandbox/src/index.ts
+index 60dd6b3badfa8b9b2db2fb7ca63edefa9a69ea6a..b9d61693a8fab2ca8545636ad782986c77e5eb7b 100644
+--- a/packages/fs/fs-sandbox/src/index.ts
++++ b/packages/fs/fs-sandbox/src/index.ts
+@@ -31,7 +31,7 @@ import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
+ import type { Config as LocalConfig } from '@deepseek-ai/dsh-fs-local'
+ import { FsError } from '@deepseek-ai/dsh-fs'
+ import type { FsEditOutcome, FsEditRequest, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+-import { writableRoots } from '@deepseek-ai/dsh-sandbox'
++import { sandboxControlRoot, writableRoots } from '@deepseek-ai/dsh-sandbox'
+ import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
+ import type {} from '@deepseek-ai/dsh-sandbox-policy'
+ import { isPathUnder } from './containment.ts'
+@@ -130,6 +130,9 @@ export class SandboxedFileSystem extends LocalFileSystem {
+     // symlink ancestor swapped since the tool resolved this target), and the
+     // mutation delegates with THIS fresh target — never the stale one.
+     const fresh = await this.resolve(target.displayPath)
++    if (process.platform === 'win32' && await isPathUnder(fresh.targetKey, sandboxControlRoot())) {
++      throw new FsError('cannot modify sandbox authority control records under confinement', 'FS_SANDBOX_DENIED')
++    }
+     let contained = false
+     for (const root of writableRoots(policy)) {
+       if (await isPathUnder(fresh.targetKey, root)) {
+diff --git a/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts b/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
+index e445c4755303a1e5906bdb8bb9618e2c76ddeff3..efb8871bf0d107f5cd1c16501da50a3076b1e36e 100644
+--- a/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
++++ b/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
+@@ -18,6 +18,7 @@ import { FsError, FsTargetKey } from '@deepseek-ai/dsh-fs'
+ import type { FsTarget } from '@deepseek-ai/dsh-fs'
+ import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
+ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
++import { sandboxControlRoot } from '@deepseek-ai/dsh-sandbox'
+ import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
+ import { SandboxedFileSystem } from '@deepseek-ai/dsh-fs-sandbox'
+ import { assertWorkspaceOutsideTemp, outsideTempWorkspaceParent } from '../../../../scripts/snapshot-workspace-parent.ts'
+@@ -91,6 +92,26 @@ describe('read-only', () => {
+ describe('workspace-write containment', () => {
+   beforeEach(() => boot('workspace-write'))
+ 
++  it.skipIf(process.platform !== 'win32')('never grants writes to authority records even when explicitly included in roots', async () => {
++    const stop = ctx.sandboxPolicy.registerWritableRoots(() => [sandboxControlRoot()])
++    const path = join(sandboxControlRoot(), `denied-test-${process.pid}.json`)
++    try {
++      await expect(fs.writeText(await target(path), 'must not be written')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
++      expect(existsSync(path)).toBe(false)
++    } finally { stop() }
++  })
++
++  it('authorizes referenced writes and edits, then denies them after unregistering', async () => {
++    const stop = ctx.sandboxPolicy.registerWritableRoots(() => [outside])
++    const path = join(outside, 'reference.txt')
++    await fs.writeText(await target(path), 'before')
++    await fs.editText(await target(path), { oldString: 'before', newString: 'after', replaceAll: false })
++    expect(await readFile(path, 'utf8')).toBe('after')
++    stop()
++    await expect(fs.writeText(await target(path), 'denied')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
++    expect(await readFile(path, 'utf8')).toBe('after')
++  })
++
+   it('a write under the workspace lands', async () => {
+     const path = join(workspace, 'nested', 'ok.txt')
+     const outcome = await fs.writeText(await target(path), 'inside')
+@@ -123,14 +144,14 @@ describe('workspace-write containment', () => {
+ 
+   it('a symlinked directory inside the workspace pointing OUT is denied (canonicalized before containment)', async () => {
+     // workspace/link -> outside ; writing workspace/link/f.txt would land in outside/f.txt.
+-    await symlink(outside, join(workspace, 'link'))
++    await symlink(outside, join(workspace, 'link'), process.platform === 'win32' ? 'junction' : 'dir')
+     const path = join(workspace, 'link', 'f.txt')
+     await expect(fs.writeText(await target(path), 'x')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+     expect(existsSync(join(outside, 'f.txt'))).toBe(false)
+   })
+ 
+   it('a NEW file created under a symlinked-out directory is denied (deepest-ancestor realpath)', async () => {
+-    await symlink(outside, join(workspace, 'link'))
++    await symlink(outside, join(workspace, 'link'), process.platform === 'win32' ? 'junction' : 'dir')
+     const path = join(workspace, 'link', 'newdir', 'deep.txt')
+     await expect(fs.writeText(await target(path), 'x')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+     expect(existsSync(join(outside, 'newdir'))).toBe(false)
+diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
+index 45028746ff4d16c3789448769906294b229565b5..fe4297baa7caca405551371159992f632c433943 100644
+--- a/packages/sandbox/sandbox-local/src/index.ts
++++ b/packages/sandbox/sandbox-local/src/index.ts
+@@ -37,7 +37,7 @@ import z from '@deepseek-ai/schemastery'
+ import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox'
+ import type { ConfinedArgv, ConfinedSandboxMode, RunnerFailureRule, SandboxEnforcement, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
+ import type { SessionId } from '@deepseek-ai/dsh-session'
+-import { AclWriteGrant, assertTempRootOutsideWorkspace, registerAclDiagnosisSkill, tempWriteSid, workspaceWriteSid } from '@deepseek-ai/dsh-sandbox-windows-acl'
++import { assertPrivateTempDisjoint, extraRootControlDirectory, reserveExtraRootLease, revokeExtraRoots, reconcileExtraRoots, AclWriteGrant, assertTempRootOutsideWorkspace, registerAclDiagnosisSkill, tempWriteSid, workspaceWriteSid } from '@deepseek-ai/dsh-sandbox-windows-acl'
+ import { assertNever } from '@deepseek-ai/dsh-util-values'
+ import { bwrapProfileArgs, landlockProfileArgs, seatbeltProfileArgs } from './profiles.ts'
+ 
+@@ -343,6 +343,22 @@ export class LocalSandboxProvider extends SandboxProvider {
+     })
+   }
+ 
++  /** Revoke future extra-root tokens first; reject until all earlier invocation leases settle. */
++  override async revokeWritableRoots(workspaceRoot: string, roots: readonly string[]): Promise<void> {
++    if (this.selectRunner('workspace-write').runner !== 'windows-acl' || this.runnerCommand !== undefined) {
++      throw new Error('sandbox-local: writable-root revocation is not implemented by this backend')
++    }
++    revokeExtraRoots(canonicalPath(workspaceRoot), roots.map(root => canonicalPath(root)))
++  }
++
++  /** Explicitly re-enable references only after their old invocations have settled. */
++  override async reconcileWritableRoots(workspaceRoot: string, roots: readonly string[]): Promise<void> {
++    if (this.selectRunner('workspace-write').runner !== 'windows-acl' || this.runnerCommand !== undefined) {
++      throw new Error('sandbox-local: writable-root reconciliation is not implemented by this backend')
++    }
++    reconcileExtraRoots(canonicalPath(workspaceRoot), roots.map(root => canonicalPath(root)))
++  }
++
+   /** The selected rung's runner invocation (program + profile arguments) for one policy. */
+   private runnerArgv(runner: SelectedRunner['runner'], policy: SandboxPolicy): string[] {
+     switch (runner) {
+@@ -367,6 +383,14 @@ export class LocalSandboxProvider extends SandboxProvider {
+    * @returns the runner invocation.
+    */
+   private windowsAclRunnerArgv(policy: SandboxPolicy): string[] {
++    const roots = policy.mode === 'workspace-write'
++      ? [...new Set((policy.additionalWritableRoots ?? []).map(root => canonicalPath(root)))].filter(root => root !== policy.workspaceRoot)
++      : []
++    if (policy.mode === 'workspace-write') {
++      assertPrivateTempDisjoint([policy.workspaceRoot, ...roots], extraRootControlDirectory())
++    }
++    // Reserve synchronously before exposing argv. Pending/unspawned calls block revocation too.
++    const extraArgs = roots.length === 0 ? [] : ['--extra-root-lease', reserveExtraRootLease(policy.workspaceRoot, roots)]
+     const sessionId = policy.sessionId
+     if (sessionId === undefined || policy.mode === 'read-only') {
+       return [
+@@ -374,6 +398,7 @@ export class LocalSandboxProvider extends SandboxProvider {
+         '--workspace', policy.workspaceRoot,
+         '--temp', tmpdir(),
+         '--mode', policy.mode,
++        ...extraArgs,
+       ]
+     }
+     const temp = this.materializeAclGrant(sessionId, policy.workspaceRoot)
+@@ -384,6 +409,7 @@ export class LocalSandboxProvider extends SandboxProvider {
+       '--mode', policy.mode,
+       '--write-sid', workspaceWriteSid(policy.workspaceRoot),
+       '--temp-write-sid', temp.writeSid,
++      ...extraArgs,
+     ]
+   }
+ 
+diff --git a/packages/sandbox/sandbox-local/src/profiles.ts b/packages/sandbox/sandbox-local/src/profiles.ts
+index 23c10d5f827dc0122d234d6dd673da2d19e502f6..b66a49cc60ac6dfcaae355df52b77c0e7e3f7001 100644
+--- a/packages/sandbox/sandbox-local/src/profiles.ts
++++ b/packages/sandbox/sandbox-local/src/profiles.ts
+@@ -17,7 +17,9 @@ export function bwrapProfileArgs(policy: SandboxPolicy): string[] {
+   const args = ['--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent']
+   if (policy.mode === 'workspace-write') {
+     args.push('--tmpfs', '/tmp')
+-    args.push('--bind', policy.workspaceRoot, policy.workspaceRoot)
++    for (const root of new Set([policy.workspaceRoot, ...policy.additionalWritableRoots ?? []])) {
++      args.push('--bind', root, root)
++    }
+   }
+   return args
+ }
+@@ -30,7 +32,7 @@ export function bwrapProfileArgs(policy: SandboxPolicy): string[] {
+ export function landlockProfileArgs(policy: SandboxPolicy): string[] {
+   const readWrite = ['/dev/null']
+   if (policy.mode === 'workspace-write') {
+-    readWrite.push('/tmp', policy.workspaceRoot)
++    readWrite.push(...new Set(['/tmp', policy.workspaceRoot, ...policy.additionalWritableRoots ?? []]))
+   }
+   return landlockGrantArgs({ readOnly: ['/'], readWrite })
+ }
+diff --git a/packages/sandbox/sandbox-local/tests/local.spec.ts b/packages/sandbox/sandbox-local/tests/local.spec.ts
+index 41a33b5ff6a58abbabca4df64b752b1a172dd942..5ab35a1d123b68e8f597b405e4becd19304f2e1d 100644
+--- a/packages/sandbox/sandbox-local/tests/local.spec.ts
++++ b/packages/sandbox/sandbox-local/tests/local.spec.ts
+@@ -84,6 +84,25 @@ describe('profile dialects', () => {
+     ])
+   })
+ 
++  it('adds deduplicated extra workspace-write roots to bwrap and Landlock', () => {
++    const policy: SandboxPolicy = { ...WW, additionalWritableRoots: ['/trusted', '/trusted', '/ws'] }
++    expect(bwrapProfileArgs(policy)).toEqual([...bwrapProfileArgs(WW), '--bind', '/trusted', '/trusted'])
++    expect(landlockProfileArgs(policy)).toEqual([...landlockProfileArgs(WW), '--rw', '/trusted'])
++  })
++
++  it('ignores extra roots in every read-only profile', () => {
++    const policy: SandboxPolicy = { ...RO, additionalWritableRoots: ['/trusted'] }
++    expect(bwrapProfileArgs(policy)).toEqual(bwrapProfileArgs(RO))
++    expect(landlockProfileArgs(policy)).toEqual(landlockProfileArgs(RO))
++    expect(seatbeltProfileArgs(policy)).toEqual(seatbeltProfileArgs(RO))
++  })
++
++  it('includes additional roots in the Seatbelt allow-list with escaped literals', () => {
++    const policy: SandboxPolicy = { ...WW, additionalWritableRoots: ['/trusted/quoted"path'] }
++    const profile = seatbeltProfileArgs(policy)[1]
++    expect(profile).toContain('(subpath ' + JSON.stringify('/trusted/quoted"path') + ')')
++  })
++
+   it('landlock read-only: readable tree plus a writable /dev/null, nothing else', () => {
+     // /dev/null specifically, NOT /dev: a whole-/dev grant would let confined
+     // commands write real host paths beneath it (/dev/shm) under read-only.
+diff --git a/packages/sandbox/sandbox-policy/src/index.ts b/packages/sandbox/sandbox-policy/src/index.ts
+index e97796db5cd18a7c0df621da128fef12eb92794b..46994a197b862e3103e874dbb85fd85ae747ed4c 100644
+--- a/packages/sandbox/sandbox-policy/src/index.ts
++++ b/packages/sandbox/sandbox-policy/src/index.ts
+@@ -44,7 +44,7 @@ function renderPolicyContext(policy: SandboxExecutionPolicy): string {
+     case 'read-only':
+       return 'Current DSH file policy: read-only. Any available operation enforced by the DSH file sandbox cannot modify files in the standing mode. Do not refuse a required modification from this policy alone: try an available tool normally and follow any denial and escalation guidance it returns.'
+     case 'workspace-write':
+-      return `Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: ${JSON.stringify(policy.workspaceRoot)}. Some platform temporary areas may also be writable.`
++      return `Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: ${JSON.stringify(policy.workspaceRoot)}.${policy.additionalWritableRoots?.length ? ` Additional human-authorized writable roots: ${JSON.stringify(policy.additionalWritableRoots)}.` : ''} Some platform temporary areas may also be writable.`
+     case 'danger-full-access':
+       return 'Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.'
+     /* v8 ignore next 4 -- SandboxMode is a typed same-process closed union; this branch is only the static exhaustiveness guard. */
+@@ -122,6 +122,8 @@ export class SandboxPolicyService extends Service {
+   readonly defaultMode: SandboxMode
+   /** The absolute `workspace-write` fallback root for calls without a session cwd. */
+   readonly workspaceRoot: string
++  private readonly writableRootProviders = new Set<{ provider: (request: SandboxPolicyRequest) => readonly string[] }>()
++
+   constructor(ctx: Context, config: Config) {
+     super(ctx, 'sandboxPolicy')
+     // schemastery (static Config) already filled `mode`; the cast records that
+@@ -152,6 +154,23 @@ export class SandboxPolicyService extends Service {
+     })
+   }
+ 
++  /**
++   * Contribute additional human-authorized writable roots at each resolve.
++   * The contributing plugin owns configuration trust and human authorization;
++   * tool arguments and model-authored data must not grant roots. Contributions
++   * are validated as absolute execution-world paths and grant writes only in
++   * `workspace-write`. Disposing the contributor removes its registration.
++   * @param provider - synchronous request-time source of authorized roots.
++   * @returns idempotent disposer for this exact registration.
++   */
++  registerWritableRoots(provider: (request: SandboxPolicyRequest) => readonly string[]): () => void {
++    return this.ctx.effect(() => {
++      const registration = { provider }
++      this.writableRootProviders.add(registration)
++      return () => { this.writableRootProviders.delete(registration) }
++    }, 'sandboxPolicy.registerWritableRoots()')
++  }
++
+   /**
+    * Resolve the complete policy for one capability call. An approved explicit
+    * mode outranks the session's last `sandbox/mode` event, which outranks the
+@@ -163,9 +182,18 @@ export class SandboxPolicyService extends Service {
+    */
+   resolve(request: SandboxPolicyRequest = {}): SandboxExecutionPolicy {
+     const { session } = request
++    const mode = request.mode ?? (session === undefined ? undefined : this.overrideOf(session)) ?? this.defaultMode
++    const roots = new Set<string>()
++    for (const { provider } of this.writableRootProviders) {
++      for (const root of provider(request)) {
++        if (!isAbsolute(root)) throw new Error('sandbox-policy: additional writable root must be an absolute execution-world path')
++        roots.add(root)
++      }
++    }
+     return {
+-      mode: request.mode ?? (session === undefined ? undefined : this.overrideOf(session)) ?? this.defaultMode,
++      mode,
+       workspaceRoot: resolveWorkspaceRoot(session?.header.cwd ?? this.workspaceRoot),
++      ...mode === 'workspace-write' && roots.size > 0 ? { additionalWritableRoots: [...roots] } : {},
+       ...session === undefined ? {} : { sessionId: session.id },
+     }
+   }
+diff --git a/packages/sandbox/sandbox-policy/tests/policy.spec.ts b/packages/sandbox/sandbox-policy/tests/policy.spec.ts
+index a6ed4d9fb407f13facace30c2a9b9bf31d80ee98..6f43ace25c77ebc7a5ed2e9f013c6f990a107ee1 100644
+--- a/packages/sandbox/sandbox-policy/tests/policy.spec.ts
++++ b/packages/sandbox/sandbox-policy/tests/policy.spec.ts
+@@ -75,6 +75,67 @@ describe('SandboxPolicyService', () => {
+     })
+   })
+ 
++  it('collects fresh request-specific roots from every provider and snapshots the result', async () => {
++    const ctx = await mounted({ mode: 'workspace-write', workspaceRoot: '/fallback' })
++    const active = session('sess-extra', '/projects/current')
++    const configured = ['/trusted/first']
++    const seen: unknown[] = []
++    ctx.sandboxPolicy.registerWritableRoots(request => {
++      seen.push(request)
++      return request.session === active ? configured : []
++    })
++    const stop = ctx.sandboxPolicy.registerWritableRoots(() => ['/trusted/second', '/trusted/first'])
++    const request = { session: active }
++    const first = ctx.sandboxPolicy.resolve(request)
++    expect(first.additionalWritableRoots).toEqual(['/trusted/first', '/trusted/second'])
++    expect(seen).toEqual([request])
++    configured.push('/trusted/third')
++    expect(ctx.sandboxPolicy.resolve(request).additionalWritableRoots).toEqual(['/trusted/first', '/trusted/third', '/trusted/second'])
++    expect(first.additionalWritableRoots).toEqual(['/trusted/first', '/trusted/second'])
++    stop()
++    stop()
++    expect(ctx.sandboxPolicy.resolve(request).additionalWritableRoots).toEqual(configured)
++    expect(ctx.sandboxPolicy.resolve().additionalWritableRoots).toBeUndefined()
++    await ctx.fiber.dispose()
++  })
++
++  it('collects but never authorizes additional roots outside workspace-write', async () => {
++    const ctx = await mounted()
++    let calls = 0
++    ctx.sandboxPolicy.registerWritableRoots(() => { calls++; return ['/trusted'] })
++    expect(ctx.sandboxPolicy.resolve().additionalWritableRoots).toBeUndefined()
++    expect(ctx.sandboxPolicy.resolve({ mode: 'danger-full-access' }).additionalWritableRoots).toBeUndefined()
++    expect(ctx.sandboxPolicy.resolve({ mode: 'workspace-write' }).additionalWritableRoots).toEqual(['/trusted'])
++    expect(calls).toBe(3)
++    await ctx.fiber.dispose()
++  })
++
++  it('rejects relative provider roots and fails closed on provider errors', async () => {
++    const ctx = await mounted()
++    const stop = ctx.sandboxPolicy.registerWritableRoots(() => ['relative/root'])
++    expect(() => ctx.sandboxPolicy.resolve()).toThrow('sandbox-policy: additional writable root must be an absolute execution-world path')
++    stop()
++    ctx.sandboxPolicy.registerWritableRoots(() => { throw new Error('configuration unavailable') })
++    expect(() => ctx.sandboxPolicy.resolve({ mode: 'workspace-write' })).toThrow('configuration unavailable')
++    await ctx.fiber.dispose()
++  })
++
++  it('owns each registration separately and removes it on contributor unload', async () => {
++    const ctx = await mounted({ mode: 'workspace-write' })
++    const provider = () => ['/trusted']
++    const first = ctx.sandboxPolicy.registerWritableRoots(provider)
++    const contributor = await ctx.plugin({
++      name: 'trusted-roots-test',
++      inject: ['sandboxPolicy'],
++      apply(scope: Context) { scope.sandboxPolicy.registerWritableRoots(provider) },
++    })
++    first()
++    expect(ctx.sandboxPolicy.resolve().additionalWritableRoots).toEqual(['/trusted'])
++    await contributor.dispose()
++    expect(ctx.sandboxPolicy.resolve().additionalWritableRoots).toBeUndefined()
++    await ctx.fiber.dispose()
++  })
++
+   it('resolves each session mode and cwd together without changing the fallback', async () => {
+     const ctx = await mounted({ mode: 'workspace-write', workspaceRoot: '/fallback' })
+     const first = session('sess-first', '/projects/first')
+@@ -181,6 +242,24 @@ describe('sandbox:policy request context', () => {
+     expect(await policyContext(ctx, session(`sess-${mode}`, '/projects/../projects/current'))).toBe(expected[mode])
+   })
+ 
++  it('shows the current authorized roots only in workspace-write context', async () => {
++    const ctx = await promptMounted({ mode: 'workspace-write' })
++    const active = session('sess-trusted-context', '/projects/current')
++    let configured = ['/trusted/one', '/trusted/quoted"path']
++    const stop = ctx.sandboxPolicy.registerWritableRoots(() => configured)
++    expect(await policyContext(ctx, active)).toContain('Additional human-authorized writable roots: ' + JSON.stringify(configured))
++    configured = ['/trusted/two']
++    expect(await policyContext(ctx, active)).toContain(JSON.stringify(configured))
++    setSandboxMode(active, 'read-only')
++    expect(await policyContext(ctx, active)).not.toContain('/trusted')
++    setSandboxMode(active, 'danger-full-access')
++    expect(await policyContext(ctx, active)).not.toContain('/trusted')
++    setSandboxMode(active, 'workspace-write')
++    stop()
++    expect(await policyContext(ctx, active)).not.toContain('Additional human-authorized')
++    await ctx.fiber.dispose()
++  })
++
+   it('keeps the complete rendered prompt byte-stable across TMPDIR changes', async () => {
+     const ctx = await promptMounted({ mode: 'workspace-write' })
+     const active = session('sess-tmpdir-stability', '/projects/current')
+diff --git a/packages/sandbox/sandbox-windows-acl/src/extra-root-lease.ts b/packages/sandbox/sandbox-windows-acl/src/extra-root-lease.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b1271a6617bd8a7003dc69c1e119143f0554441
+--- /dev/null
++++ b/packages/sandbox/sandbox-windows-acl/src/extra-root-lease.ts
+@@ -0,0 +1,107 @@
++/** Durable, fail-closed records for extra-root tokens. Never expire records by age/PID. */
++import { createHash, randomBytes } from 'node:crypto'
++import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs'
++import { homedir } from 'node:os'
++import { assertPrivateTempDisjoint } from './path-boundary.ts'
++import { basename, dirname, join, resolve } from 'node:path'
++
++export interface ExtraRootLease {
++  workspace: string
++  roots: Array<{ path: string; sid: string }>
++}
++export function extraRootControlDirectory(): string {
++  const dir = join(homedir(), '.dsh-trusted-paths-control')
++  mkdirSync(dir, { recursive: true })
++  return dir
++}
++function directory(workspace: string): string {
++  return join(extraRootControlDirectory(), createHash('sha256').update(workspace.toLowerCase()).digest('hex'))
++}
++/** Reserve before returning argv: an unspawned invocation must also block removal. */
++export function reserveExtraRootLease(workspace: string, roots: readonly string[]): string {
++  return withLeaseLock(workspace, () => reserve(workspace, roots))
++}
++function reserve(workspace: string, roots: readonly string[]): string {
++  // The control area is outside ambient tmp and every filesystem-tool writable root.
++  const control = extraRootControlDirectory()
++  assertPrivateTempDisjoint([workspace, ...roots], control)
++  assertExtraRootsEnabled(workspace, roots)
++  const dir = directory(workspace)
++  mkdirSync(dir, { recursive: true })
++  const path = join(dir, `${randomBytes(24).toString('hex')}.json`)
++  const lease: ExtraRootLease = { workspace, roots: roots.map(path => {
++    const random = randomBytes(16)
++    return { path, sid: `S-1-4-${random.readUInt32LE(0)}-${random.readUInt32LE(4)}-${random.readUInt32LE(8)}-${random.readUInt32LE(12)}-2` }
++  }) }
++  writeFileSync(path, JSON.stringify(lease), { flag: 'wx' })
++  return path
++}
++export function readExtraRootLease(path: string, workspace: string): ExtraRootLease {
++  if (dirname(resolve(path)).toLowerCase() !== resolve(directory(workspace)).toLowerCase()
++    || !/^[a-f0-9]{48}\.json(?:\.running\.json)?$/u.test(basename(path))) throw new Error('Invalid extra-root lease path')
++  const value = JSON.parse(readFileSync(path, 'utf8')) as ExtraRootLease
++  if (value === null || typeof value !== 'object' || typeof value.workspace !== 'string'
++    || value.workspace.toLowerCase() !== workspace.toLowerCase() || !Array.isArray(value.roots)
++    || value.roots.some(root => root === null || typeof root !== 'object' || typeof root.path !== 'string' || typeof root.sid !== 'string' || !/^S-1-4-(?:\d+-){4}2$/u.test(root.sid))) {
++    throw new Error('Invalid extra-root lease')
++  }
++  return value
++}
++/** Only after the entire Job is empty AND every revocable ACE cleanup succeeded. */
++export function completeExtraRootLease(path: string): void { unlinkSync(path) }
++/** Atomic single-use claim prevents replaying one lease into concurrent token owners. */
++export function claimExtraRootLease(path: string, workspace: string): { path: string; lease: ExtraRootLease } {
++  return withLeaseLock(workspace, () => {
++    if (!/^[a-f0-9]{48}\.json$/u.test(basename(path))) throw new Error('Extra-root lease already claimed')
++    const lease = readExtraRootLease(path, workspace)
++    const claimed = `${path}.running.json`
++    if (existsSync(claimed)) throw new Error('Extra-root lease already claimed')
++    renameSync(path, claimed)
++    return { path: claimed, lease }
++  })
++}
++function marker(workspace: string, root: string): string {
++  return join(directory(workspace), `${createHash('sha256').update(root.toLowerCase()).digest('hex')}.revoked`)
++}
++function assertExtraRootsEnabled(workspace: string, roots: readonly string[]): void {
++  if (roots.some(root => existsSync(marker(workspace, root)))) throw new Error('Additional writable root is revoked; reconcile it before execution')
++}
++/** Atomic directory lock: contention/crash fails closed instead of guessing ownership. */
++function withLeaseLock<T>(workspace: string, action: () => T): T {
++  const dir = directory(workspace)
++  mkdirSync(dir, { recursive: true })
++  const lock = join(dir, 'lock')
++  mkdirSync(lock)
++  try { return action() } finally { rmdirSync(lock) }
++}
++export function revokeExtraRoots(workspace: string, roots: readonly string[]): void {
++  withLeaseLock(workspace, () => {
++    for (const root of roots) writeFileSync(marker(workspace, root), '')
++    assertExtraRootsIdle(workspace, roots)
++  })
++}
++export function reconcileExtraRoots(workspace: string, roots: readonly string[]): void {
++  withLeaseLock(workspace, () => {
++    assertExtraRootsIdle(workspace, roots)
++    for (const root of roots) {
++      try { unlinkSync(marker(workspace, root)) } catch (error) {
++        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
++      }
++    }
++  })
++}
++/** Unknown, corrupt, pending, running and failed-cleanup records all block removal. */
++export function assertExtraRootsIdle(workspace: string, roots: readonly string[]): void {
++  let names: string[]
++  try { names = readdirSync(directory(workspace)) } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
++    throw error
++  }
++  const wanted = new Set(roots.map(root => root.toLowerCase()))
++  for (const name of names.filter(name => name.endsWith('.json'))) {
++    const lease = readExtraRootLease(join(directory(workspace), name), workspace)
++    if (lease.roots.some(root => wanted.has(root.path.toLowerCase()))) {
++      throw new Error('Additional writable root still has a pending/running/unclean invocation; stop related tasks and retry. Never remove its lease until all token-bearing processes are proven terminated.')
++    }
++  }
++}
+diff --git a/packages/sandbox/sandbox-windows-acl/src/index.ts b/packages/sandbox/sandbox-windows-acl/src/index.ts
+index 5de5d47b72cab3caf0b022bfeef620395630f214..a08645f46a2a1834231e3f1b4bf1d67e6a526563 100644
+--- a/packages/sandbox/sandbox-windows-acl/src/index.ts
++++ b/packages/sandbox/sandbox-windows-acl/src/index.ts
+@@ -45,7 +45,8 @@
+ 
+ import { existsSync, statSync } from 'node:fs'
+ import { resolve } from 'node:path'
+-import { Win32Error } from '@deepseek-ai/dsh-win32-process'
++import { setTimeout as delay } from 'node:timers/promises'
++import { isJobEmpty, terminateJob, Win32Error } from '@deepseek-ai/dsh-win32-process'
+ 
+ import { grantWrite, revokeWrite } from './acl.ts'
+ import { allocPtrSlot, decodePtr, isNullPtr, throwLastError, win32 } from './ffi.ts'
+@@ -55,8 +56,9 @@ import { drainPipe, spawnSandboxed, spawnSandboxedInherited, waitForExit } from
+ import { createRestrictedToken, findLogonSid, makeWellKnownSid, openCurrentProcessToken, restrictTokenIntegrity, setTokenDefaultDaclGrant } from './token.ts'
+ import * as abi from './win32-abi.ts'
+ 
++export { extraRootControlDirectory, reserveExtraRootLease, revokeExtraRoots, reconcileExtraRoots } from './extra-root-lease.ts'
+ export { AclWriteGrant } from './grant.ts'
+-export { assertTempRootOutsideWorkspace } from './path-boundary.ts'
++export { assertPrivateTempDisjoint, assertTempRootOutsideWorkspace } from './path-boundary.ts'
+ export { tempWriteSid, workspaceWriteSid } from './workspace-sid.ts'
+ export { ACL_DIAGNOSIS_SKILL, registerAclDiagnosisSkill } from './acl-skill.ts'
+ /** Construction options: the workspace/temp allowlists and their distinct SID identities. */
+@@ -84,6 +86,8 @@ export interface AclSandboxOptions {
+    * cannot use the standing workspace capability in one another's temp tree.
+    */
+   tempWriteSid?: string
++  /** Runner-owned RANDOM revocable capabilities, never the standing workspace SID. */
++  extraWritableRoots?: readonly { path: string; sid: string }[]
+   /**
+    * The file-effect mode this instance confines under — selects the
+    * restricted token's restricting-SID list (I for read-only, J for
+@@ -171,6 +175,8 @@ export class AclSandbox {
+   readonly mode: 'read-only' | 'workspace-write'
+   private readonly tempDirOption: string | null | undefined
+   private readonly manageDacls: boolean
++  private readonly extraWritableRoots: readonly { path: string; sid: string }[]
++  private extraSidPtrs: NativePtr[] = []
+   private tempDirResolved: string | null | undefined
+   private api: Win32Bindings | undefined
+   private token: NativePtr | undefined
+@@ -181,6 +187,14 @@ export class AclSandbox {
+   private grantedPaths: Array<{ path: string; sidPtr: NativePtr }> = []
+ 
+   constructor(options: AclSandboxOptions) {
++    this.extraWritableRoots = options.extraWritableRoots ?? []
++    if (options.mode === 'read-only' && this.extraWritableRoots.length > 0) throw new Error('read-only rejects extra writable roots')
++    const sids = new Set([options.writeSid, options.tempWriteSid].filter(Boolean))
++    for (const root of this.extraWritableRoots) {
++      if (!/^S-1-4-(?:\d+-){4}2$/u.test(root.sid) || sids.has(root.sid)) throw new Error('Extra writable root requires a distinct random capability SID')
++      sids.add(root.sid)
++      if (!statSync(root.path).isDirectory()) throw new Error('Extra writable root must be an existing directory')
++    }
+     this.mode = options.mode
+     this.manageDacls = options.manageDacls ?? true
+     this.writableDirs = options.writableDirs.map((directory) => {
+@@ -240,6 +254,7 @@ export class AclSandbox {
+       }
+       this.writeSidPtr = this.writeSid === undefined ? undefined : parseSid(this.writeSid)
+       this.tempWriteSidPtr = this.tempWriteSid === undefined ? undefined : parseSid(this.tempWriteSid)
++      for (const root of this.extraWritableRoots) this.extraSidPtrs.push(parseSid(root.sid))
+ 
+       const tempDir = this.mode === 'read-only' || this.tempDirOption === null ? null : this.tempDirOption
+       /* v8 ignore next -- constructor validation requires workspace-write to supply
+@@ -249,7 +264,7 @@ export class AclSandbox {
+         if (!existsSync(tempDir) || !statSync(tempDir).isDirectory()) {
+           throw new Error(`AclSandbox temp dir does not exist or is not a directory: ${tempDir}`)
+         }
+-        assertPrivateTempDisjoint(this.writableDirs, tempDir)
++        assertPrivateTempDisjoint([...this.writableDirs, ...this.extraWritableRoots.map(root => root.path)], tempDir)
+       }
+       this.tempDirResolved = tempDir
+ 
+@@ -279,9 +294,15 @@ export class AclSandbox {
+           }
+         }
+       }
++      // Extras are ALWAYS runner-owned and revocable, even with seam-managed workspace/temp grants.
++      for (const [index, root] of this.extraWritableRoots.entries()) {
++        const sidPtr = this.extraSidPtrs[index]!
++        this.grantedPaths.push({ path: root.path, sidPtr })
++        grantWrite(api, root.path, sidPtr, lowLabelSid, worldSid)
++      }
+       const logonSid = findLogonSid(api, currentToken)
+       this.sidAllocations.push(logonSid)
+-      const writeSids = [this.writeSidPtr, this.tempWriteSidPtr].filter((sid): sid is NativePtr => sid !== undefined)
++      const writeSids = [this.writeSidPtr, this.tempWriteSidPtr, ...this.extraSidPtrs].filter((sid): sid is NativePtr => sid !== undefined)
+       restrictedToken = createRestrictedToken(
+         api, currentToken, logonSid, writeSids,
+         { world: worldSid },
+@@ -301,7 +322,7 @@ export class AclSandbox {
+       // DACL passes pass-2. Choosing the temp SID prevents default-DACL
+       // objects in one session's temp tree from acquiring the shared
+       // workspace capability.
+-      setTokenDefaultDaclGrant(api, restrictedToken, this.tempWriteSidPtr ?? this.writeSidPtr ?? worldSid)
++      setTokenDefaultDaclGrant(api, restrictedToken, this.extraSidPtrs[0] ?? this.tempWriteSidPtr ?? this.writeSidPtr ?? worldSid)
+       if (api.closeHandle(currentToken) === 0) throwLastError(api, 'CloseHandle', 'current process token')
+       currentTokenOpen = false
+       this.api = api
+@@ -327,6 +348,7 @@ export class AclSandbox {
+       for (const [label, sidPtr] of [['workspace write SID', this.writeSidPtr], ['temp write SID', this.tempWriteSidPtr]] as const) {
+         freeSidBestEffort(api, sidPtr, label, cleanupFailures)
+       }
++      for (const sidPtr of this.extraSidPtrs.splice(0)) freeSidBestEffort(api, sidPtr, 'extra root SID', cleanupFailures)
+       for (const sidPtr of this.sidAllocations.splice(0)) {
+         freeSidBestEffort(api, sidPtr, 'init SID allocation', cleanupFailures)
+       }
+@@ -376,6 +398,9 @@ export class AclSandbox {
+         wait: async () => {
+           exitCodePromise ??= Promise.resolve(waitForExit(api, native.process))
+           const exitCode = await exitCodePromise
++          // Kill residual descendants, then PROVE every job process has exited before any lease completes.
++          terminateJob(api, native.job, 1)
++          while (!isJobEmpty(api, native.job)) await delay(10)
+           if (api.closeHandle(native.job) === 0) throwLastError(api, 'CloseHandle', 'kill-on-close job')
+           return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode }
+         },
+@@ -410,7 +435,7 @@ export class AclSandbox {
+     const api = this.api
+     if (api === undefined) return
+     const failures: unknown[] = []
+-    if (this.manageDacls) {
++    {
+       for (const grant of this.grantedPaths) {
+         try {
+           revokeWrite(api, grant.path, grant.sidPtr)
+@@ -432,6 +457,7 @@ export class AclSandbox {
+         failures.push(error)
+       }
+     }
++    for (const sidPtr of this.extraSidPtrs.splice(0)) freeSidBestEffort(api, sidPtr, 'extra root SID', failures)
+     for (const sidPtr of this.sidAllocations.splice(0)) {
+       freeSidBestEffort(api, sidPtr, 'init SID allocation', failures)
+     }
+diff --git a/packages/sandbox/sandbox-windows-acl/src/runner.ts b/packages/sandbox/sandbox-windows-acl/src/runner.ts
+index 8c673780a22b12ea46b364728ff5f51b289f90ff..bd8b18f3ac0d7c14b80b1ec7a794e9d481deb5ad 100644
+--- a/packages/sandbox/sandbox-windows-acl/src/runner.ts
++++ b/packages/sandbox/sandbox-windows-acl/src/runner.ts
+@@ -48,6 +48,7 @@ import { SUBPROCESS_CONTROL_ENV, SUBPROCESS_CONTROL_FD } from '@deepseek-ai/dsh-
+ import { closeSync, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+ import { join } from 'node:path'
+ 
++import { completeExtraRootLease, claimExtraRootLease } from './extra-root-lease.ts'
+ import { win32 } from './ffi.ts'
+ import { AclSandbox, assertTempRootOutsideWorkspace } from './index.ts'
+ import { tempWriteSid, workspaceWriteSid } from './workspace-sid.ts'
+@@ -69,6 +70,7 @@ interface ParsedArgs {
+   mode: 'read-only' | 'workspace-write'
+   writeSid: string | undefined
+   tempWriteSid: string | undefined
++  extraRootLease: string | undefined
+   command: string
+   args: string[]
+ }
+@@ -79,6 +81,7 @@ function parseArgs(raw: string[]): ParsedArgs {
+   let mode: string | undefined
+   let writeSid: string | undefined
+   let parsedTempWriteSid: string | undefined
++  let extraRootLease: string | undefined
+   let index = 0
+   for (; index < raw.length; index++) {
+     const token = raw[index]
+@@ -90,6 +93,7 @@ function parseArgs(raw: string[]): ParsedArgs {
+     const value = raw[index]
+     if (value === undefined) fail(`missing value after ${token}`)
+     switch (token) {
++      case '--extra-root-lease': extraRootLease = value; break
+       case '--workspace': workspace = value; break
+       case '--temp': temp = value; break
+       case '--mode': mode = value; break
+@@ -104,7 +108,7 @@ function parseArgs(raw: string[]): ParsedArgs {
+   const argv = raw.slice(index)
+   const command = argv[0]
+   if (command === undefined) fail('missing command after --')
+-  return { workspace, temp, mode, writeSid, tempWriteSid: parsedTempWriteSid, command, args: argv.slice(1) }
++  return { workspace, temp, mode, extraRootLease, writeSid, tempWriteSid: parsedTempWriteSid, command, args: argv.slice(1) }
+ }
+ 
+ function requireDirectory(label: string, path: string): void {
+@@ -131,6 +135,9 @@ async function main(): Promise<number> {
+     assertTempRootOutsideWorkspace(parsed.workspace, parsed.temp)
+   }
+ 
++  if (parsed.mode === 'read-only' && parsed.extraRootLease !== undefined) fail('read-only rejects extra root leases')
++  const extraLease = parsed.extraRootLease === undefined ? undefined : claimExtraRootLease(parsed.extraRootLease, parsed.workspace)
++  for (const root of extraLease?.lease.roots ?? []) assertTempRootOutsideWorkspace(root.path, parsed.temp)
+   const api = await win32()
+   // Ignore this process's own CTRL+C: the confined child (same console) keeps
+   // handling its own; the runner must survive to revoke grants and mirror the
+@@ -142,6 +149,7 @@ async function main(): Promise<number> {
+   let ownedTempDir: string | undefined
+   let sandbox: AclSandbox | undefined
+   let initialized = false
++  let childSettled = false
+   try {
+     let privateTempDir: string | null = null
+     let writeSid: string | undefined
+@@ -166,6 +174,7 @@ async function main(): Promise<number> {
+       ...writeSid === undefined ? {} : { writeSid },
+       ...privateTempSid === undefined ? {} : { tempWriteSid: privateTempSid },
+       manageDacls: !seamManaged,
++      extraWritableRoots: extraLease?.lease.roots ?? [],
+     })
+     await sandbox.init()
+     initialized = true
+@@ -187,12 +196,14 @@ async function main(): Promise<number> {
+     })
+     if (process.env[SUBPROCESS_CONTROL_ENV] === 'pipe') closeSync(SUBPROCESS_CONTROL_FD)
+     const result = await child.wait()
++    childSettled = true
+     return result.exitCode
+   } finally {
+     // Cleanup failures must not mask the child's exit code: report and keep going.
+     if (initialized) {
+       try {
+         sandbox?.dispose()
++        if (childSettled && extraLease !== undefined) completeExtraRootLease(extraLease.path)
+       } catch (error) {
+         process.stderr.write(`${RUNNER_SIGNATURE}: cleanup: ${error instanceof Error ? error.message : String(error)}\n`)
+       }
+diff --git a/packages/sandbox/sandbox-windows-acl/tests/extra-root-lease.spec.ts b/packages/sandbox/sandbox-windows-acl/tests/extra-root-lease.spec.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..093004aba57efc9310f4451256a718b2ecc628a0
+--- /dev/null
++++ b/packages/sandbox/sandbox-windows-acl/tests/extra-root-lease.spec.ts
+@@ -0,0 +1,41 @@
++import { afterAll, describe, expect, it, vi } from 'vitest'
++import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
++import { join } from 'node:path'
++const testHome = vi.hoisted(() => process.cwd())
++vi.mock('node:os', () => ({ homedir: () => testHome }))
++import { reserveExtraRootLease, readExtraRootLease, claimExtraRootLease, completeExtraRootLease, revokeExtraRoots, reconcileExtraRoots } from '../src/extra-root-lease.ts'
++const created: string[] = []
++function pair() {
++  const dir = mkdtempSync(join(process.cwd(), 'lease-unit-'))
++  created.push(dir)
++  const workspace = join(dir, 'workspace'); const root = join(dir, 'root')
++  mkdirSync(workspace); mkdirSync(root)
++  return { workspace, root }
++}
++afterAll(() => { for (const dir of created) rmSync(dir, { recursive: true, force: true }) })
++describe('extra-root leases', () => {
++  it('reserves before spawn, revokes future grants, and never expires running tokens', () => {
++    const { workspace, root } = pair()
++    const first = reserveExtraRootLease(workspace, [root]); const second = reserveExtraRootLease(workspace, [root])
++    expect(readExtraRootLease(first, workspace).roots[0]!.sid).not.toBe(readExtraRootLease(second, workspace).roots[0]!.sid)
++    expect(() => revokeExtraRoots(workspace, [root])).toThrow(/pending\/running/)
++    expect(() => reserveExtraRootLease(workspace, [root])).toThrow(/revoked/)
++    expect(() => reconcileExtraRoots(workspace, [root])).toThrow(/pending\/running/)
++    const running = claimExtraRootLease(first, workspace)
++    expect(() => claimExtraRootLease(first, workspace)).toThrow()
++    expect(() => claimExtraRootLease(running.path, workspace)).toThrow()
++    completeExtraRootLease(running.path); completeExtraRootLease(second)
++    revokeExtraRoots(workspace, [root])
++    expect(() => reserveExtraRootLease(workspace, [root])).toThrow(/revoked/)
++    reconcileExtraRoots(workspace, [root])
++    const last = reserveExtraRootLease(workspace, [root]); completeExtraRootLease(last)
++  })
++  it('rejects control-area overlap and arbitrary lease paths', () => {
++    const { workspace } = pair()
++    expect(() => reserveExtraRootLease(workspace, [process.cwd()])).toThrow(/disjoint/)
++    expect(() => reserveExtraRootLease(process.cwd(), [workspace])).toThrow(/disjoint/)
++    const arbitrary = join(workspace, 'forged.json')
++    writeFileSync(arbitrary, JSON.stringify({ workspace, roots: [] }))
++    expect(() => claimExtraRootLease(arbitrary, workspace)).toThrow()
++  })
++})
+diff --git a/packages/sandbox/sandbox/src/index.ts b/packages/sandbox/sandbox/src/index.ts
+index 3cc0ec9f64eb523e73033652614d1706cdc1cad4..33855bf032a3ab86718d51b2d65482195727f22e 100644
+--- a/packages/sandbox/sandbox/src/index.ts
++++ b/packages/sandbox/sandbox/src/index.ts
+@@ -19,7 +19,7 @@ export {
+   validateEscalationArgs,
+ } from './escalation.ts'
+ export type { EscalationApproval, EscalationApprover, EscalationOutcome, EscalationRequest } from './escalation.ts'
+-export { canonicalPath, writableRoots } from './roots.ts'
++export { sandboxControlRoot, canonicalPath, writableRoots } from './roots.ts'
+ 
+ /**
+  * File-effect policy for confined processes. `read-only` permits only required
+@@ -42,6 +42,8 @@ export interface SandboxExecutionPolicy {
+   mode: SandboxMode
+   /** Absolute root directory `workspace-write` may write under. */
+   workspaceRoot: string
++  /** Additional human-authorized absolute roots; writable only under `workspace-write`. */
++  additionalWritableRoots?: readonly string[]
+   /**
+    * Opaque identity of the calling session (the branded `dsh-session`
+    * SessionId). Backends key per-session state off it (e.g. windows-acl gives
+@@ -175,6 +177,16 @@ export abstract class SandboxProvider extends Service {
+    *   the selected backend achieves for it.
+    */
+   abstract confine(argv: readonly string[], policy: SandboxPolicy, signal?: AbortSignal): Promise<ConfinedArgv>
++
++  /** Revoke future extra-root invocations; refuse while an earlier invocation may still hold authority. */
++  async revokeWritableRoots(_workspaceRoot: string, roots: readonly string[]): Promise<void> {
++    if (roots.length > 0) throw new Error('sandbox backend does not support writable-root revocation')
++  }
++
++  /** Re-enable explicit human-authorized roots only when earlier invocations are settled. */
++  async reconcileWritableRoots(_workspaceRoot: string, roots: readonly string[]): Promise<void> {
++    if (roots.length > 0) throw new Error('sandbox backend does not support writable-root reconciliation')
++  }
+ }
+ 
+ export default SandboxProvider
+diff --git a/packages/sandbox/sandbox/src/roots.ts b/packages/sandbox/sandbox/src/roots.ts
+index 1215f3dac1650adf7f295a54ce7cd80cf2a011a3..b43eb9460152816d9fc12f2c2fd1e53b86c0c101 100644
+--- a/packages/sandbox/sandbox/src/roots.ts
++++ b/packages/sandbox/sandbox/src/roots.ts
+@@ -14,7 +14,13 @@
+  */
+ 
+ import { realpathSync } from 'node:fs'
+-import { tmpdir } from 'node:os'
++import { tmpdir, homedir } from 'node:os'
++import { join } from 'node:path'
++
++/** Host-only authority records must never be writable through confined file tools. */
++export function sandboxControlRoot(): string {
++  return join(homedir(), '.dsh-trusted-paths-control')
++}
+ import type { SandboxExecutionPolicy } from './index.ts'
+ 
+ /**
+@@ -45,11 +51,12 @@ export function canonicalPath(path: string): string {
+  * canonical, deduplicated allow-list. `read-only` allows nothing;
+  * `workspace-write` allows the policy's workspace root, the host `/tmp`, and
+  * the per-user platform temp dir (`os.tmpdir()` — the real temp area for
+- * mkstemp-family tools; omitting it would deny what the mode promises).
++ * mkstemp-family tools; omitting it would deny what the mode promises), plus
++ * any additional human-authorized writable roots carried by the policy.
+  * @param policy - the file-effect policy to derive the allow-list from.
+  * @returns the canonical writable roots; empty exactly under `read-only`.
+  */
+ export function writableRoots(policy: SandboxExecutionPolicy): string[] {
+   if (policy.mode !== 'workspace-write') return []
+-  return [...new Set([policy.workspaceRoot, '/tmp', tmpdir()].map(canonicalPath))]
++  return [...new Set([policy.workspaceRoot, '/tmp', tmpdir(), ...policy.additionalWritableRoots ?? []].map(canonicalPath))]
+ }
+diff --git a/packages/sandbox/sandbox/tests/roots.spec.ts b/packages/sandbox/sandbox/tests/roots.spec.ts
+index 1541363b9556b710f891e48ecd2943638fae774c..7c03569607c23281e341b50d3fc49b060509c49c 100644
+--- a/packages/sandbox/sandbox/tests/roots.spec.ts
++++ b/packages/sandbox/sandbox/tests/roots.spec.ts
+@@ -33,6 +33,16 @@ describe('writableRoots', () => {
+     expect(writableRoots({ mode: 'read-only', workspaceRoot: process.cwd() })).toEqual([])
+   })
+ 
++  it('canonicalizes and deduplicates additional roots only for workspace-write', () => {
++    const extra = mkdtempSync(join(tmpdir(), 'dsh-extra-'))
++    roots.push(extra)
++    const policy = { workspaceRoot: process.cwd(), additionalWritableRoots: [extra, extra] }
++    const writable = writableRoots({ ...policy, mode: 'workspace-write' })
++    expect(writable.filter(root => root === realpathSync.native(extra))).toHaveLength(1)
++    expect(writableRoots({ ...policy, mode: 'read-only' })).toEqual([])
++    expect(writableRoots({ ...policy, mode: 'danger-full-access' })).toEqual([])
++  })
++
+   it('workspace-write grants the workspace root plus the platform temp areas, canonical and deduplicated', () => {
+     const ws = mkdtempSync(join(tmpdir(), 'dsh-ws-'))
+     roots.push(ws)
+diff --git a/packages/settings/settings/src/index.ts b/packages/settings/settings/src/index.ts
+index e0586ecb24c1263d30c88a6ed0c1cd0d11d2dc43..97acf0c08a55f905ec492234461a6594c46ed8fe 100644
+--- a/packages/settings/settings/src/index.ts
++++ b/packages/settings/settings/src/index.ts
+@@ -225,7 +225,7 @@ export class SettingsForms extends Service {
+   private revisions = new Map<string, { raw: string | undefined; revision: number; ns: SettingsNamespace; autoGenerate: boolean }>()
+   private closed = false
+   private scheduled = false
+-  private readonly presentations = new Map<Fiber, { auto?: boolean }>()
++  private readonly presentations = new Map<Fiber, { auto?: boolean; restart?: boolean }>()
+ 
+   constructor(private readonly ownerContext: Context) {
+     super(ownerContext, 'settings')
+@@ -258,12 +258,12 @@ export class SettingsForms extends Service {
+   }
+ 
+   /** Register the calling plugin instance's page policy without changing its Config.
+-   * @param presentation Automatic-page policy for this instance; `auto` defaults to true.
++   * @param presentation Instance form policy: `auto` defaults to true; `restart` opts into the full ordinary Config schema and Loader remounts on nonvolatile edits.
+    * @param owner Plugin instance the policy belongs to; defaults to the calling fiber.
+    * @returns Disposer; register it with the calling plugin's effects.
+    * @throws If this instance already has a registered policy.
+    */
+-  configure(presentation: { auto?: boolean }, owner: Fiber = this.ctx.fiber): () => void {
++  configure(presentation: { auto?: boolean; restart?: boolean }, owner: Fiber = this.ctx.fiber): () => void {
+     const fiber = owner
+     if (this.presentations.has(fiber)) throw new Error('Settings presentation is already configured for this plugin instance')
+     const policy = { ...presentation }
+@@ -305,7 +305,7 @@ export class SettingsForms extends Service {
+       const schema = this.schema(entry)
+       if (schema === undefined || entry.fiber === undefined
+         || entry.fiber.runtime === null || entry.fiber.state !== FiberState.ACTIVE) return []
+-      const form = volatileForm(schema)
++      const form = this.presentations.get(entry.fiber)?.restart ? schema : volatileForm(schema)
+       if (form === undefined) return []
+       active.add(entry.id)
+       const raw = JSON.stringify([entry.fiber.uid, schema.toJSON(), entry.options.config ?? {}])
+@@ -382,10 +382,11 @@ export class SettingsForms extends Service {
+     const entry = this.ownerContext.configEditor.entries().find(row => row.options.id === ns)
+     const schema = entry === undefined ? undefined : this.schema(entry)
+     if (entry === undefined || schema === undefined) throw new Error(`No configurable plugin entry "${ns}"`)
+-    const form = volatileForm(schema)
++    const restart = entry.fiber !== undefined && this.presentations.get(entry.fiber)?.restart === true
++    const form = restart ? schema : volatileForm(schema)
+     if (form === undefined) throw new Error(`Plugin entry "${ns}" has no volatile fields`)
+     for (const path of paths) {
+-      if (path.length && !isVolatilePath(schema, path)) throw new Error(`Config field "${path.join('.')}" is not volatile`)
++      if (!restart && path.length && !isVolatilePath(schema, path)) throw new Error(`Config field "${path.join('.')}" is not volatile`)
+     }
+     await this.ownerContext.configEditor.edit(entry, (raw, inherited) => {
+       const descriptor = this.describe().find(row => row.ns === ns)
+@@ -406,7 +407,7 @@ export class SettingsForms extends Service {
+           else throw new Error(`Config field "${target.join('.')}" is not volatile`)
+         }
+       }
+-      validatePaths(next, form)
++      if (!restart) validatePaths(next, form)
+       const strip = (value: Record<string, unknown>, node: z, path: string[] = []): Record<string, unknown> => {
+         if (isVolatilePath(schema, path)) return {}
+         const result = { ...value }
+diff --git a/packages/settings/settings/tests/configuration-fixture.ts b/packages/settings/settings/tests/configuration-fixture.ts
+index 4f81ec8d90c9275214757e914b1f82a734b2fbdb..021365be59e33191b48d89726b0c1cb76137190c 100644
+--- a/packages/settings/settings/tests/configuration-fixture.ts
++++ b/packages/settings/settings/tests/configuration-fixture.ts
+@@ -12,7 +12,7 @@ import Hmr from '@deepseek-ai/dsh-hmr'
+ import DefaultModel from '@deepseek-ai/dsh-agent-default-model'
+ import Settings from '../src/index.ts'
+ 
+-export async function configurationFixture(options: { schema?: z; apply?: (ctx: Context, config: unknown) => void; hmr?: boolean } = {}) {
++export async function configurationFixture(options: { schema?: z; apply?: (ctx: Context, config: unknown) => void; hmr?: boolean; restart?: boolean } = {}) {
+   const home = realpathSync(mkdtempSync(join(tmpdir(), 'settings-config-')))
+   const dir = join(home, 'profiles', 'test')
+   onTestFinished(() => { rmSync(home, { recursive: true, force: true }) })
+@@ -34,8 +34,12 @@ export async function configurationFixture(options: { schema?: z; apply?: (ctx:
+     installAnchor: join(home, 'package.json'), cwd: home, home, overlays: [], telemetryDisabledEnv: undefined,
+   }
+   const Probe = {
++    inject: options.restart ? ['settings'] : [],
+     Config: options.schema ?? z.object({ ordinary: z.string().required(), count: z.number().min(1).default(2).volatile(), token: z.string().role('secret').volatile(), list: z.array(z.object({ name: z.string().required(), token: z.string().role('secret') })).volatile() }),
+-    apply: options.apply ?? (() => {}),
++    apply: (ctx: Context, config: unknown) => {
++      if (options.restart) ctx.effect(() => ctx.settings.configure({ restart: true, auto: false }))
++      options.apply?.(ctx, config)
++    },
+   }
+   const start = async (): Promise<Context> => {
+     const ctx = await boot('test', join(dir, 'cordis.yml'), readProfilePatches('test', profile), (ctx) => {
+diff --git a/packages/settings/settings/tests/configuration.spec.ts b/packages/settings/settings/tests/configuration.spec.ts
+index 5bafea1e5be3f523025477f0b3d5f14199484e48..c9a4c08fe59cec80a27b52ff0e3db323bb3966eb 100644
+--- a/packages/settings/settings/tests/configuration.spec.ts
++++ b/packages/settings/settings/tests/configuration.spec.ts
+@@ -312,6 +312,61 @@ it('registers optional presentation policy after Settings loads and removes it w
+   await vi.waitFor(() => { expect(ctx.settings.describe().find(view => view.ns === 'first')!.autoGenerate).toBe(false) })
+ })
+ 
++it('exposes ordinary schemas for restart policy and awaits full remount before resolving mutations', async () => {
++  const schema = z.object({ ordinary: z.string().required(), count: z.number().min(1).default(2), token: z.string().role('secret') })
++  let beginDispose!: () => void
++  let finishDispose!: () => void
++  const disposing = new Promise<void>(resolve => { beginDispose = resolve })
++  const disposed = new Promise<void>(resolve => { finishDispose = resolve })
++  const events: string[] = []
++  const { ctx } = await fixture({ schema, restart: true, hmr: false, apply: (plugin, config) => {
++    const value = (config as { ordinary: string }).ordinary
++    events.push(`apply:${value}`)
++    plugin.effect(() => async () => {
++      if (value !== 'fixed') return
++      events.push('dispose:start')
++      beginDispose()
++      await disposed
++      events.push('dispose:end')
++    })
++  } })
++  const first = ctx.settings.describe({ redactSecrets: true }).find(row => row.ns === 'first')!
++  expect(first.autoGenerate).toBe(false)
++  expect(first.schema).toEqual(schema.toJSON())
++  expect(first.value).toEqual({ ordinary: 'fixed', count: 2 })
++  expect(first.secrets).toContainEqual({ path: ['token'], set: true })
++  expect(JSON.stringify(first)).not.toContain('private')
++  let resolved = false
++  const write = ctx.settings.mutate('first', [{ op: 'set', path: ['ordinary'], value: 'changed' }], first.revision)
++    .then(() => { resolved = true })
++  await disposing
++  expect(resolved).toBe(false)
++  expect(events).not.toContain('apply:changed')
++  finishDispose()
++  await write
++  expect(events.filter(event => event !== 'apply:second')).toEqual(['apply:fixed', 'dispose:start', 'dispose:end', 'apply:changed'])
++  expect(ctx.settings.describe().find(row => row.ns === 'first')!.value).toEqual({ ordinary: 'changed', count: 2, token: 'private' })
++  expect(ctx.settings.describe().find(row => row.ns === 'first')!.autoGenerate).toBe(false)
++  expect(ctx.settings.describe().find(row => row.ns === 'second')!.value).toMatchObject({ ordinary: 'second' })
++})
++
++it('rejects invalid restart edits and rolls back activation failures through the config editor', async () => {
++  const schema = z.object({ ordinary: z.string().required(), count: z.number().min(1).default(2), token: z.string().role('secret') })
++  const { ctx, profile } = await fixture({ schema, restart: true, hmr: false, apply: (_plugin, config) => {
++    if ((config as { ordinary: string }).ordinary === 'rejected') throw new Error('activation refused')
++  } })
++  const before = readFileSync(profile.patchPath, 'utf8')
++  await expect(ctx.settings.update('first', { count: 0 })).rejects.toThrow()
++  await expect(ctx.settings.mutate('first', [{ op: 'set', path: ['ordinary'], value: 42 }])).rejects.toThrow()
++  expect(readFileSync(profile.patchPath, 'utf8')).toBe(before)
++  await expect(ctx.settings.update('first', { ordinary: 'rejected' })).rejects.toThrow()
++  expect(readFileSync(profile.patchPath, 'utf8')).toBe(before)
++  expect(ctx.settings.describe().find(row => row.ns === 'first')!.value).toEqual({ ordinary: 'fixed', count: 2, token: 'private' })
++  await ctx.settings.update('first', { ordinary: 'updated', count: 5 })
++  await ctx.settings.replace('first', { ordinary: 'replaced' })
++  expect(ctx.settings.describe().find(row => row.ns === 'first')!.value).toEqual({ ordinary: 'replaced', count: 5, token: 'private' })
++})
++
+ it('imports the removed settings.yaml into the profile once and keeps rejected sections in the renamed file', async () => {
+   const { ctx, home, profile, start } = await fixture()
+   await ctx.fiber.dispose()
+diff --git a/packages/workspace/workspace/src/entity.ts b/packages/workspace/workspace/src/entity.ts
+index 0d687e8c94c9af2a10e979a42f8912550ab71baa..4ac47b91ab64f18974ab4321f3327f6b7634a781 100644
+--- a/packages/workspace/workspace/src/entity.ts
++++ b/packages/workspace/workspace/src/entity.ts
+@@ -42,10 +42,10 @@ export interface WorkspaceEntityHost {
+    * Validate an already-accounted session, preserving ownership when its fully
+    * qualified cwd cannot resolve because a path component is missing.
+    * @param id - Session already present in this workspace's candidate account.
+-   * @param path - Workspace's stored canonical directory.
++   * @param record - Workspace identity, explicit directory history, and account snapshot.
+    * @returns whether the candidate remains a member.
+    */
+-  candidateMatches(id: SessionId, path: string): boolean
++  candidateMatches(id: SessionId, record: WorkspaceRecord): boolean
+ 
+   /**
+    * Read one stored session header for attach validation.
+@@ -61,6 +61,12 @@ export interface WorkspaceEntityHost {
+    * @param path - Canonical existing directory from the immutable header cwd.
+    */
+   rememberSessionPath(id: SessionId, path: string): void
++
++  /** Reject a directory already admitted by a different workspace. */
++  assertDirectoryAvailable(id: WorkspaceId, path: string): void
++
++  /** Serialize directory admission with registry create/delete operations. */
++  changeDirectory(operation: () => Promise<void>): Promise<void>
+ }
+ 
+ /** Chain-slot abort sentinel thrown by the update fn when the record needs no change; only `mutate` observes it. */
+@@ -87,6 +93,32 @@ export class WorkspaceEntity implements Workspace {
+     return this.record.path
+   }
+ 
++  get defaultDirectory(): string {
++    return this.record.defaultDirectory ?? this.record.path
++  }
++
++  get sessionDirectoryPaths(): readonly string[] {
++    return [...new Set([this.record.path, ...(this.record.sessionDirectoryPaths ?? [])])]
++  }
++
++  async setDefaultDirectory(path: string): Promise<void> {
++    const canonical = await realpathNormalize(path)
++    if (!(await stat(canonical)).isDirectory()) {
++      throw new Error(`cannot set workspace default directory to '${canonical}': path is not a directory`)
++    }
++    await this.host.changeDirectory(() => this.mutate((record) => {
++      this.host.assertDirectoryAvailable(this.id, canonical)
++      if ((record.defaultDirectory ?? record.path) === canonical) return record
++      // Capture both ends on the serialized write chain. Old session cwd facts
++      // remain admissible even when creation overlaps another default change.
++      const sessionDirectoryPaths = [...new Set([
++        record.path, ...(record.sessionDirectoryPaths ?? []),
++        record.defaultDirectory ?? record.path, canonical,
++      ])]
++      return { ...record, defaultDirectory: canonical, sessionDirectoryPaths }
++    }))
++  }
++
+   get title(): string {
+     return this.record.title
+   }
+@@ -100,7 +132,7 @@ export class WorkspaceEntity implements Workspace {
+   }
+ 
+   get sessionIds(): readonly SessionId[] {
+-    return this.record.sessionIds.filter(id => this.host.candidateMatches(id, this.record.path))
++    return this.record.sessionIds.filter(id => this.host.candidateMatches(id, this.record))
+   }
+ 
+   async setTitle(title: string): Promise<void> {
+@@ -136,7 +168,7 @@ export class WorkspaceEntity implements Workspace {
+           + `its cwd '${header.cwd}' is not a directory`,
+         )
+       }
+-      if (cwd !== this.record.path) {
++      if (cwd !== this.record.path && !(this.record.sessionDirectoryPaths ?? []).includes(cwd)) {
+         throw new Error(
+           `cannot attach session '${sessionId}' to workspace '${this.record.path}': `
+           + `its cwd resolves to '${cwd}'`,
+@@ -206,7 +238,7 @@ export class WorkspaceEntity implements Workspace {
+       next = await this.host.table().update(this.id, (current) => {
+         const changed = fn(current)
+         const sessionIds = changed.sessionIds.filter(
+-          id => this.host.candidateMatches(id, changed.path),
++          id => this.host.candidateMatches(id, changed),
+         )
+         if (changed === current && sessionIds.length === current.sessionIds.length) {
+           throw unchangedSentinel
+diff --git a/packages/workspace/workspace/src/index.ts b/packages/workspace/workspace/src/index.ts
+index 0f630500cb6eb5bc2b1b5492d8258d13f1c8404a..0c8488af72461dbfd25a10b91b911003055ca0c9 100644
+--- a/packages/workspace/workspace/src/index.ts
++++ b/packages/workspace/workspace/src/index.ts
+@@ -182,8 +182,27 @@ export class WorkspaceRegistry extends Service {
+ 
+   private readonly host: WorkspaceEntityHost = {
+     table: () => this.requireTable(),
+-    candidateMatches: (id, path) => this.sessionPaths.get(id) === path || this.missingSessionPaths.has(id),
++    changeDirectory: operation => this.enqueueOperation(operation),
++    candidateMatches: (id, record) => {
++      const path = this.sessionPaths.get(id)
++      return path === record.path
++        || (path !== undefined && (record.sessionDirectoryPaths ?? []).includes(path))
++        || this.missingSessionPaths.has(id)
++    },
+     readSessionHeader: id => this.readSessionHeader(id),
++    assertDirectoryAvailable: (id, path) => {
++      // Include pending creates published before their first storage await.
++      for (const entity of this.entities.values()) {
++        if (entity.id !== id && entity.sessionDirectoryPaths.includes(path)) {
++          throw new Error(`session directory '${path}' is already owned by workspace '${entity.id}'`)
++        }
++      }
++      for (const [otherId, record] of this.requireTable().entries()) {
++        if (otherId !== id && (record.path === path || (record.sessionDirectoryPaths ?? []).includes(path))) {
++          throw new Error(`session directory '${path}' is already owned by workspace '${otherId}'`)
++        }
++      }
++    },
+     rememberSessionPath: (id, path) => {
+       this.sessionPaths.set(id, path)
+       this.missingSessionPaths.delete(id)
+@@ -512,6 +531,7 @@ export class WorkspaceRegistry extends Service {
+       if (entity.path === canonical) return entity
+     }
+ 
++    this.host.assertDirectoryAvailable(WorkspaceId(''), canonical)
+     const workspaceName = title ?? defaultWorkspaceTitle(canonical)
+     const table = this.requireTable()
+     const state = this.requireState()
+@@ -763,14 +783,16 @@ export class WorkspaceRegistry extends Service {
+     const paths = new Map<string, WorkspaceId>()
+     const accounted = new Map<SessionId, WorkspaceId>()
+     for (const [id, record] of table.entries()) {
+-      const pathHolder = paths.get(record.path)
+-      if (pathHolder !== undefined) {
+-        throw new Error(
+-          `workspace domain is inconsistent: path '${record.path}' is claimed `
+-          + `by both workspace '${pathHolder}' and workspace '${id}'`,
+-        )
++      for (const path of new Set([record.path, ...(record.sessionDirectoryPaths ?? [])])) {
++        const pathHolder = paths.get(path)
++        if (pathHolder !== undefined) {
++          throw new Error(
++            `workspace domain is inconsistent: path '${path}' is claimed `
++            + `by both workspace '${pathHolder}' and workspace '${id}'`,
++          )
++        }
++        paths.set(path, id)
+       }
+-      paths.set(record.path, id)
+       for (const sessionId of record.sessionIds) {
+         const holder = accounted.get(sessionId)
+         if (holder !== undefined) {
+@@ -845,7 +867,7 @@ export class WorkspaceRegistry extends Service {
+     for (const entity of this.entities.values()) {
+       const record = this.requireTable().get(entity.id) as WorkspaceRecord
+       for (const sessionId of record.sessionIds) {
+-        if (this.host.candidateMatches(sessionId, record.path)) continue
++        if (this.host.candidateMatches(sessionId, record)) continue
+         const path = this.sessionPaths.get(sessionId)
+         const reason = this.invalidSessionPaths.get(sessionId)
+           ?? (this.headers.has(sessionId)
+diff --git a/packages/workspace/workspace/src/spec.ts b/packages/workspace/workspace/src/spec.ts
+index 9bd792258ae984bc48fefb5c6872846d0aede512..c9f89f461484e2eb96c42cc8597882ddc068bd03 100644
+--- a/packages/workspace/workspace/src/spec.ts
++++ b/packages/workspace/workspace/src/spec.ts
+@@ -23,6 +23,10 @@ const sessionId = z.string().transform(value => brandString<SessionId>(value))
+  */
+ export const workspaceRecord = z.object({
+   path: z.string(),
++  /** Optional canonical cwd for future sessions; never changes workspace identity. */
++  defaultDirectory: z.string().optional(),
++  /** Explicitly approved session directories, retained across default changes. Not sandbox grants. */
++  sessionDirectoryPaths: z.array(z.string()).optional(),
+   title: z.string(),
+   sessionIds: z.array(sessionId),
+   createdAt: z.string(),
+diff --git a/packages/workspace/workspace/src/types.ts b/packages/workspace/workspace/src/types.ts
+index 1b09bef969b0c90aabbd4d1a1091371b6a0e76e1..7fe4ea8a2a9391d6d03a20d1d1d44d04c929a8fe 100644
+--- a/packages/workspace/workspace/src/types.ts
++++ b/packages/workspace/workspace/src/types.ts
+@@ -77,6 +77,20 @@ export interface Workspace {
+    */
+   readonly path: string
+ 
++  /** Canonical cwd for new sessions, falling back to the immutable identity path. */
++  readonly defaultDirectory: string
++
++  /** Canonical identity and explicitly recorded session directories; not access grants. */
++  readonly sessionDirectoryPaths: readonly string[]
++
++  /**
++   * Set the cwd used only by future sessions. Existing session headers and
++   * accounting remain unchanged; this does not grant sandbox access.
++   * @param path - Fully qualified existing directory, canonicalized before storage.
++   * @returns resolution after durability.
++   */
++  setDefaultDirectory(path: string): Promise<void>
++
+   /** Display title. Defaults to the final path segment, or a filesystem root's own spelling; duplicates are allowed. */
+   readonly title: string
+ 
+@@ -111,7 +125,8 @@ export interface Workspace {
+    * accounted id resolves without writing, aside from the durable
+    * filtered-candidate prune every accepted mutation performs. A new id's
+    * live or persisted
+-   * header cwd must resolve to an existing directory equal to {@link path};
++   * header cwd must resolve to {@link path} or an explicitly recorded default
++   * directory (including prior defaults);
+    * unknown ids, missing or invalid cwd values, and mismatches reject without
+    * writing.
+    * @param sessionId - The session to record.
+diff --git a/packages/workspace/workspace/tests/workspace.spec.ts b/packages/workspace/workspace/tests/workspace.spec.ts
+index 988e9995697bbb6f7082adbd977fc3102c2af269..8c28dfb25e7aba23f6e0678df9461c1d3d266bc9 100644
+--- a/packages/workspace/workspace/tests/workspace.spec.ts
++++ b/packages/workspace/workspace/tests/workspace.spec.ts
+@@ -191,6 +191,81 @@ afterEach(async () => {
+   base = undefined as never
+ })
+ 
++describe('Workspace default session directory', () => {
++  it('keeps identity and old/new directory accounts across changes and restart', async () => {
++    const original = await makeDir('original')
++    const next = await makeDir('next')
++    const third = await makeDir('third')
++    const unrelated = await makeDir('unrelated')
++    const headers = [header('old', original), header('next', next), header('third', third), header('foreign', unrelated)]
++    const result = await harness({ sessions: [headers[0]!] })
++    result.setSessions(headers)
++    const workspace = (await result.registry.resolveByPath(original))!
++    const id = workspace.id
++    expect(workspace.defaultDirectory).toBe(original)
++    await workspace.setDefaultDirectory(next)
++    await workspace.attachSession(SessionId('next'))
++    await workspace.setDefaultDirectory(third)
++    await workspace.attachSession(SessionId('third'))
++    await expect(workspace.attachSession(SessionId('foreign'))).rejects.toThrow('cwd resolves')
++    expect(workspace.path).toBe(original)
++    expect(workspace.defaultDirectory).toBe(third)
++    expect(workspace.sessionIds).toEqual(['third', 'next', 'old'])
++    expect(storedRecord(result.pool, id).sessionDirectoryPaths).toEqual([original, next, third])
++    const restored = await harness({ pool: result.pool, sessions: headers })
++    expect(restored.registry.get(id)?.sessionIds).toEqual(['third', 'next', 'old'])
++    expect(restored.registry.get(id)?.defaultDirectory).toBe(third)
++    await restored.registry.get(id)!.detachSession(SessionId('next'))
++    await restored.registry.get(id)!.attachSession(SessionId('next'))
++    expect(restored.registry.get(id)?.sessionIds).toEqual(['next', 'third', 'old'])
++  })
++
++  it('refuses another workspace identity or history and prevents claiming an approved directory', async () => {
++    const original = await makeDir('original')
++    const other = await makeDir('other')
++    const next = await makeDir('next')
++    const third = await makeDir('third')
++    const result = await harness()
++    const workspace = await result.registry.create(original)
++    const second = await result.registry.create(other)
++    await expect(workspace.setDefaultDirectory(other)).rejects.toThrow('already owned')
++    await workspace.setDefaultDirectory(next)
++    await workspace.setDefaultDirectory(third)
++    expect(workspace.sessionDirectoryPaths).toEqual([original, next, third])
++    await expect(second.setDefaultDirectory(next)).rejects.toThrow('already owned')
++    await expect(result.registry.create(next)).rejects.toThrow('already owned')
++    expect(second.defaultDirectory).toBe(other)
++  })
++
++  it('rejects relative, nonexistent and file defaults without mutation', async () => {
++    const original = await makeDir('original')
++    const file = join(original, 'file.txt')
++    await writeFile(file, 'file')
++    const result = await harness()
++    const workspace = await result.registry.create(original)
++    const before = storedRecord(result.pool, workspace.id)
++    for (const path of ['relative', join(original, 'missing'), file]) {
++      await expect(workspace.setDefaultDirectory(path)).rejects.toThrow()
++    }
++    expect(storedRecord(result.pool, workspace.id)).toEqual(before)
++    expect(workspace.defaultDirectory).toBe(original)
++  })
++
++  it('canonicalizes symlinks and treats an unchanged default as a no-op', async () => {
++    const original = await makeDir('original')
++    const next = await makeDir('next')
++    const alias = join(base, 'next-link')
++    await symlink(next, alias, process.platform === 'win32' ? 'junction' : 'dir')
++    const result = await harness()
++    const workspace = await result.registry.create(original)
++    await workspace.setDefaultDirectory(alias)
++    expect(workspace.defaultDirectory).toBe(next)
++    result.changes.length = 0
++    await workspace.setDefaultDirectory(next)
++    expect(result.changes).toEqual([])
++  })
++})
++
+ describe('WorkspaceRegistry lifecycle and bootstrap', () => {
+   it('stays pending without sessionPersistence and never opens or marks the domain', async () => {
+     const pool = new MemoryMediaPool()
