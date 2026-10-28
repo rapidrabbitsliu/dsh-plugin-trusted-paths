@@ -1,0 +1,21 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdirSync,mkdtempSync,rmSync} from 'node:fs';
+import {resolve,join} from 'node:path';
+import {apply} from '../index.js';
+const base=mkdtempSync(resolve('.trusted-binding-'));
+const old=join(base,'old'),primary=join(base,'primary'),ref=join(base,'ref');
+for(const dir of [old,primary,ref])mkdirSync(dir);
+test.after(()=>rmSync(base,{recursive:true,force:true}));
+test('workspace binding sets new-session default and scopes authority to members',async()=>{
+ let provider,cleanup,selected;
+ const revoked=[];
+ const workspace={path:old,sessionIds:['member'],async setDefaultDirectory(path){selected=path;}};
+ const ctx={workspaceRegistry:{get:id=>id==='workspace'?workspace:undefined},sandboxPolicy:{registerWritableRoots(fn){provider=fn;return()=>{};}},sandbox:{async reconcileWritableRoots(){},async revokeWritableRoots(cwd,roots){revoked.push([cwd,roots]);}},effect(fn){cleanup=fn();}};
+ await apply(ctx,{workspaces:[{workspaceId:'workspace',primaryFolder:primary,references:[ref]}]});
+ assert.equal(selected,primary);
+ assert.deepEqual(provider({session:{id:'member',header:{cwd:old}}}),[primary,ref]);
+ assert.deepEqual(provider({session:{id:'unrelated',header:{cwd:primary}}}),[]);
+ await cleanup();
+ assert.ok(revoked.some(([cwd,roots])=>cwd===old&&roots.includes(primary)&&roots.includes(ref)));
+});

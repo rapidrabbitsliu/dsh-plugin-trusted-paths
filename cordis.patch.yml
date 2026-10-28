@@ -1,0 +1,5 @@
+- insert:
+    - id: local-trusted-paths
+      name: dsh-plugin-trusted-paths
+      config:
+        workspaces: []
